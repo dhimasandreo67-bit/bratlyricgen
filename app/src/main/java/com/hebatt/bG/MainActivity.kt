@@ -1884,6 +1884,18 @@ fun BratHomeScreen() {
                 initial = current,
                 player = mediaPlayer,
                 maxMs = durationMs,
+                aspect = selectedAspect,
+                style = revealStyle,
+                holdMs = holdMs,
+                shiftMs = shiftMs,
+                bgColor = videoBgColor,
+                fontColor = videoFontColor,
+                transparent = transparentBg,
+                textScale = lyricTextScale,
+                blurAmount = blurAmount,
+                boxWidthPct = boxWidthPct,
+                boxHeightPct = boxHeightPct,
+                showBoxOutline = showBoxOutline,
                 onSave = { edited ->
                     lyrics = if (edited.isEmpty()) null else edited
                     showEditor = false
@@ -2009,6 +2021,18 @@ private fun LyricEditorDialog(
     initial: List<LyricLine>,
     player: MediaPlayer?,
     maxMs: Long,
+    aspect: AspectOption,
+    style: RevealStyle,
+    holdMs: Long,
+    shiftMs: Long,
+    bgColor: Color,
+    fontColor: Color,
+    transparent: Boolean,
+    textScale: Float,
+    blurAmount: Float,
+    boxWidthPct: Float,
+    boxHeightPct: Float,
+    showBoxOutline: Boolean,
     onSave: (List<LyricLine>) -> Unit,
     onCancel: () -> Unit
 ) {
@@ -2023,20 +2047,37 @@ private fun LyricEditorDialog(
         }
     }
 
-    var playCounter by remember { mutableIntStateOf(0) }
-    var playFrom by remember { mutableLongStateOf(0L) }
-    var playTo by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(playCounter) {
-        if (playCounter == 0) return@LaunchedEffect
-        val p = player ?: return@LaunchedEffect
-        try {
-            p.seekTo(playFrom.toInt())
-            p.start()
-            while (p.currentPosition < playTo) delay(50L)
-            p.pause()
-        } catch (_: IllegalStateException) {
+    // Snapshot reaktif: berubah tiap kali user edit teks / timing
+    val currentLyrics: List<LyricLine> = rows.mapNotNull { row ->
+        if (row.words.isEmpty()) return@mapNotNull null
+        LyricLine(row.words.map { LyricWord(it.text, it.startMs, it.endMs) })
+    }.sortedBy { it.startMs }
+    val renderer = remember(currentLyrics) { BratFrameRenderer(currentLyrics) }
+
+    var previewPosMs by remember {
+        mutableLongStateOf(
+            (rows.firstOrNull()?.startMs ?: 0L).let { (it - 300L).coerceAtLeast(0L) }
+        )
+    }
+    var isPreviewPlaying by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isPreviewPlaying, player) {
+        if (player == null || !isPreviewPlaying) return@LaunchedEffect
+        val end = maxMs.coerceAtLeast(500L)
+        while (isPreviewPlaying) {
+            delay(33L)
+            runCatching {
+                var pos = player.currentPosition.toLong()
+                if (pos >= end) {
+                    player.seekTo(0)
+                    player.start()
+                    pos = 0
+                }
+                previewPosMs = pos
+            }
         }
     }
+
     DisposableEffect(Unit) {
         onDispose { runCatching { player?.pause() } }
     }
@@ -2047,6 +2088,8 @@ private fun LyricEditorDialog(
     ) {
         Surface(modifier = Modifier.fillMaxSize(), color = APP_BG) {
             Column(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
+
+                // === HEADER ===
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -2057,7 +2100,7 @@ private fun LyricEditorDialog(
                             fontWeight = FontWeight.Black, color = APP_FONT
                         )
                         Text(
-                            "${rows.size} baris · ubah teks, atur start/end, atau timing per kata",
+                            "${rows.size} baris · edit teks & timing, preview realtime di atas",
                             fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f)
                         )
                     }
@@ -2083,6 +2126,128 @@ private fun LyricEditorDialog(
                 }
                 HorizontalDivider(color = APP_FONT.copy(alpha = 0.2f))
 
+                // === PREVIEW AREA (sticky) ===
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.Black)
+                        .padding(8.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Box(
+                            modifier = Modifier.fillMaxWidth().height(160.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Canvas(
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .aspectRatio(aspect.ratio)
+                                    .clipToBounds()
+                            ) {
+                                drawIntoCanvas { c ->
+                                    renderer.draw(
+                                        c.nativeCanvas,
+                                        size.width.toInt().coerceAtLeast(1),
+                                        size.height.toInt().coerceAtLeast(1),
+                                        if (transparent) 0 else bgColor.toArgb(),
+                                        fontColor.toArgb(),
+                                        previewPosMs,
+                                        style, holdMs, shiftMs,
+                                        blur = !transparent,
+                                        blurAmount = blurAmount,
+                                        textScale = textScale,
+                                        boxWidthPct = boxWidthPct,
+                                        boxHeightPct = boxHeightPct,
+                                        showBoxOutline = showBoxOutline
+                                    )
+                                }
+                            }
+                        }
+
+                        // Kontrol: restart, -1s, PLAY/PAUSE, +1s, waktu
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            SmallBtn("⏮") {
+                                previewPosMs = 0L
+                                runCatching { player?.seekTo(0) }
+                            }
+                            Spacer(Modifier.width(6.dp))
+                            SmallBtn("-1s") {
+                                val n = (previewPosMs - 1000L).coerceAtLeast(0L)
+                                previewPosMs = n
+                                runCatching { player?.seekTo(n.toInt()) }
+                            }
+                            Spacer(Modifier.width(6.dp))
+                            Surface(
+                                shape = RoundedCornerShape(20.dp),
+                                color = APP_FONT,
+                                onClick = {
+                                    val p = player ?: return@Surface
+                                    if (isPreviewPlaying) {
+                                        runCatching { p.pause() }
+                                        isPreviewPlaying = false
+                                    } else {
+                                        if (previewPosMs >= maxMs) previewPosMs = 0L
+                                        runCatching {
+                                            p.seekTo(previewPosMs.toInt())
+                                            p.start()
+                                        }
+                                        isPreviewPlaying = true
+                                    }
+                                }
+                            ) {
+                                Box(
+                                    modifier = Modifier.size(40.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        if (isPreviewPlaying) "❚❚" else "▶",
+                                        color = APP_BG, fontSize = 14.sp,
+                                        fontWeight = FontWeight.Black
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.width(6.dp))
+                            SmallBtn("+1s") {
+                                val n = (previewPosMs + 1000L).coerceAtMost(maxMs)
+                                previewPosMs = n
+                                runCatching { player?.seekTo(n.toInt()) }
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "${formatTenths(previewPosMs)} / ${formatTenths(maxMs)}",
+                                color = APP_FONT, fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        // Seek bar
+                        Slider(
+                            value = previewPosMs.toFloat()
+                                .coerceIn(0f, maxMs.toFloat().coerceAtLeast(1f)),
+                            onValueChange = {
+                                previewPosMs = it.toLong()
+                                runCatching { player?.seekTo(previewPosMs.toInt()) }
+                            },
+                            valueRange = 0f..maxMs.toFloat().coerceAtLeast(1f),
+                            modifier = Modifier.padding(horizontal = 4.dp),
+                            colors = SliderDefaults.colors(
+                                thumbColor = APP_FONT,
+                                activeTrackColor = APP_FONT,
+                                inactiveTrackColor = APP_FONT.copy(alpha = 0.3f)
+                            )
+                        )
+                    }
+                }
+                HorizontalDivider(color = APP_FONT.copy(alpha = 0.2f))
+
+                // === DAFTAR BARIS ===
                 LazyColumn(
                     modifier = Modifier.weight(1f).padding(horizontal = 16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -2094,9 +2259,13 @@ private fun LyricEditorDialog(
                             row = row,
                             maxMs = maxMs,
                             onPlay = {
-                                playFrom = (row.startMs - 300L).coerceAtLeast(0L)
-                                playTo = row.endMs + 300L
-                                playCounter++
+                                val from = (row.startMs - 300L).coerceAtLeast(0L)
+                                previewPosMs = from
+                                runCatching {
+                                    player?.seekTo(from.toInt())
+                                    player?.start()
+                                }
+                                isPreviewPlaying = true
                             },
                             onDelete = { rows.remove(row) }
                         )
