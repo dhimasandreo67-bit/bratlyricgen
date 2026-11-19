@@ -1,14 +1,13 @@
 import java.util.Properties
 
-val localProps = Properties().apply {
-    val f = rootProject.file("local.properties")
-    if (f.exists()) f.reader(Charsets.UTF_8).use { load(it) }
-}
-
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
+}
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.reader(Charsets.UTF_8).use { load(it) }
 }
 
 android {
@@ -26,7 +25,6 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // === BARU ===
         buildConfigField(
             "String",
             "GROQ_API_KEY",
@@ -48,7 +46,7 @@ android {
     }
     buildFeatures {
         compose = true
-        buildConfig = true          // === BARU ===
+        buildConfig = true
     }
 }
 
@@ -63,7 +61,6 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation("androidx.compose.foundation:foundation")
-    // === BARU ===
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
 

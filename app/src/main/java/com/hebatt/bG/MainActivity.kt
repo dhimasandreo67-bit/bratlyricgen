@@ -85,24 +85,30 @@ import kotlin.math.roundToLong
 import android.graphics.Canvas as NativeCanvas
 import androidx.compose.foundation.layout.Box
 
-// ============ Tema aplikasi (FIXED) ============
+// ============ Tema aplikasi ============
 private val APP_BG = Color.Black
 private val APP_FONT = Color(0xFF8ACE00)
 
 // ============ Konstanta ============
-private const val LYRIC_OFFSET_MS = 150L      // lirik muncul sedikit lebih awal (kalibrasi)
-private const val DEFAULT_HOLD_MS = 1500L     // lirik tetap tampil setelah kata terakhir
-private const val MAX_WORDS_PER_LINE = 6      // maksimal kata per baris lirik
-private const val MIN_CUT_MS = 1000L          // minimal durasi hasil potongan
+private const val LYRIC_OFFSET_MS = 150L
+private const val DEFAULT_HOLD_MS = 1500L
+private const val MAX_WORDS_PER_LINE = 6
+private const val MIN_CUT_MS = 1000L
 private const val EXPORT_FPS = 30
+private const val WORD_DELTA_MS = 100L
 
-// ============ Warna video (customizable) ============
+// ===== BARU: box default =====
+private const val DEFAULT_BOX_WIDTH_PCT = 0.84f
+private const val DEFAULT_BOX_HEIGHT_PCT = 0.72f
+
+// ============ Warna video ============
 private val COLOR_PALETTE = listOf(
     Color(0xFF8ACE00), Color(0xFF000000), Color(0xFFFFFFFF), Color(0xFFFF1744),
     Color(0xFFFF4081), Color(0xFF00E5FF), Color(0xFFFFEA00), Color(0xFF651FFF),
 )
 private val DEFAULT_VIDEO_BG = Color(0xFF8ACE00)
 private val DEFAULT_VIDEO_FONT = Color.Black
+private const val DEFAULT_BLUR_AMOUNT = 0.25f
 
 private data class BratPreset(val label: String, val bg: Color, val font: Color)
 
@@ -119,7 +125,6 @@ private val ColorSaver = Saver<Color, Int>(
 )
 
 // ============ Rasio video ============
-// Resolusi dipilih kelipatan 16 supaya aman di encoder H.264
 private enum class AspectOption(val label: String, val w: Int, val h: Int) {
     R_1_1("1:1", 1024, 1024),
     R_16_9("16:9", 1280, 720),
@@ -131,21 +136,21 @@ private enum class AspectOption(val label: String, val w: Int, val h: Int) {
     val ratio: Float get() = w.toFloat() / h
 }
 
-// ============ Gaya reveal teks ============
+// ============ Gaya reveal ============
 private enum class RevealStyle(val label: String, val desc: String) {
     SMOOTH("SMOOTH", "Kata muncul dengan fade halus"),
     BLINK("BLINK", "Kata langsung muncul tanpa transisi"),
     BRAT("BRAT", "Kata muncul satu per satu, semua kata otomatis menyesuaikan ukuran & posisi")
 }
 
-// ============ Warna kunci untuk background "transparan" (chroma key) ============
+// ============ Warna kunci ============
 private enum class KeyColor(val label: String, val color: Color) {
     GREEN("GREEN", Color(0xFF00FF00)),
     BLUE("BLUE", Color(0xFF0000FF)),
     MAGENTA("MAGENTA", Color(0xFFFF00FF))
 }
 
-// ============ Model lirik (waktu dalam milidetik absolut) ============
+// ============ Model lirik ============
 @Serializable
 data class LyricWord(val text: String, val startMs: Long, val endMs: Long)
 
@@ -155,7 +160,7 @@ data class LyricLine(val words: List<LyricWord>) {
     val endMs: Long get() = words.last().endMs
 }
 
-// ============ Groq response model ============
+// ============ Groq response ============
 @Serializable
 private data class GroqWord(val word: String, val start: Double, val end: Double)
 
@@ -170,8 +175,11 @@ private data class GroqResponse(
 )
 
 private val JsonConfig = Json { ignoreUnknownKeys = true }
+/** Hapus tanda baca di akhir kata — titik, koma, seru, tanya, dsb. */
+private fun stripTrailingPunct(s: String): String =
+    s.trimEnd('.',',','!',';',':')
 
-// ============ Dummy lyrics (fallback preview) ============
+// ============ Dummy lyrics ============
 private fun buildDummyLyrics(durationMs: Long): List<LyricLine> {
     fun line(startFrac: Float, endFrac: Float, words: List<String>): LyricLine {
         val s = durationMs * startFrac
@@ -191,7 +199,6 @@ private fun buildDummyLyrics(durationMs: Long): List<LyricLine> {
 }
 
 // ============ Groq transcribe ============
-
 private suspend fun transcribeWithGroq(
     context: Context,
     uri: Uri,
@@ -281,7 +288,6 @@ private fun convertToLyricLines(response: GroqResponse): List<LyricLine> {
         else -> emptyList()
     }
 
-    // Kelompokkan jadi baris: jeda panjang, akhir kalimat, atau terlalu banyak kata
     val lines = mutableListOf<LyricLine>()
     var cur = mutableListOf<LyricWord>()
     for (w in flat) {
@@ -299,18 +305,25 @@ private fun convertToLyricLines(response: GroqResponse): List<LyricLine> {
         cur.add(w)
     }
     if (cur.isNotEmpty()) lines.add(LyricLine(cur))
-    return lines
+    // Buang tanda baca di akhir setiap kata
+    return lines.map { line ->
+        LyricLine(line.words.map { w -> w.copy(text = stripTrailingPunct(w.text)) })
+    }
 }
 
-// ============ Renderer gaya brat (dipakai preview DAN export) ============
-
+// ============ Renderer gaya brat (justify + blur + box) ============
 private class BratFrameRenderer(private val lyrics: List<LyricLine>) {
 
     private class Placed(val word: LyricWord, val text: String, val x: Float, val baseline: Float)
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        // Mirip Arial Narrow yang dipakai album brat
         typeface = Typeface.create("sans-serif-condensed", Typeface.NORMAL)
+    }
+    private val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = 0xFFFF0000.toInt()
+        alpha = 130
     }
 
     private var cacheIdx = -1
@@ -319,6 +332,8 @@ private class BratFrameRenderer(private val lyrics: List<LyricLine>) {
     private var cacheTextScale = 1f
     private var cacheW = 0
     private var cacheH = 0
+    private var cacheBoxWidthPct = -1f
+    private var cacheBoxHeightPct = -1f
     private var cacheSize = 0f
     private var cachePlaced: List<Placed> = emptyList()
 
@@ -336,40 +351,54 @@ private class BratFrameRenderer(private val lyrics: List<LyricLine>) {
         holdMs: Long,
         shiftMs: Long,
         blur: Boolean = true,
-        textScale: Float = 1f
+        blurAmount: Float = DEFAULT_BLUR_AMOUNT,
+        textScale: Float = 1f,
+        boxWidthPct: Float = DEFAULT_BOX_WIDTH_PCT,
+        boxHeightPct: Float = DEFAULT_BOX_HEIGHT_PCT,
+        showBoxOutline: Boolean = false
     ) {
         val timeMs = rawTimeMs - shiftMs
         canvas.drawColor(bgColor)
+
+        // Outline box (di belakang teks) — hanya jika showBoxOutline = true
+        if (showBoxOutline) {
+            val bW = w * boxWidthPct
+            val bH = h * boxHeightPct
+            val bX = (w - bW) / 2f
+            val bY = (h - bH) / 2f
+            canvas.drawRect(bX, bY, bX + bW, bY + bH, outlinePaint)
+        }
 
         val idx = lyrics.indexOfLast { it.startMs <= timeMs }
         if (idx < 0) return
         val line = lyrics[idx]
         if (timeMs > line.endMs + holdMs) return
 
-        // BRAT: hanya kata yang sudah muncul yang ikut di-layout, jadi ukuran
-        // semua kata menyesuaikan setiap ada kata baru.
         val isBrat = style == RevealStyle.BRAT
         val count = if (isBrat) line.words.count { it.startMs <= timeMs }.coerceAtLeast(1)
         else line.words.size
-        val factor = if (isBrat) 0.40f else 0.22f
+        val factor = if (isBrat) 0.28f else 0.22f
 
-        ensureLayout(idx, line, count, factor, textScale, w, h)
+        ensureLayout(idx, line, count, factor, textScale, w, h, boxWidthPct, boxHeightPct)
 
-        val radius = (min(w, h) * 0.005f).coerceAtLeast(0.5f)
+        // Blur dikontrol slider (0..1)
+        val radius = if (blur) (min(w, h) * 0.02f * blurAmount.coerceIn(0f, 1f)) else 0f
         if (radius != blurRadius) {
             blurRadius = radius
-            blurFilter = BlurMaskFilter(radius, BlurMaskFilter.Blur.NORMAL)
+            blurFilter = if (radius > 0.01f)
+                BlurMaskFilter(radius, BlurMaskFilter.Blur.NORMAL) else null
         }
-        paint.maskFilter = if (blur) blurFilter else null
+        paint.maskFilter = blurFilter
+
         paint.textSize = cacheSize
         val baseAlpha = fontColor ushr 24
 
         for (p in cachePlaced) {
             val age = timeMs - p.word.startMs
-            if (!isBrat && age < 0) continue // kata belum dinyanyikan -> belum muncul
+            if (!isBrat && age < 0) continue
             val a = when (style) {
-                RevealStyle.SMOOTH -> (age / 100f).coerceIn(0f, 1f) // fade-in halus
-                else -> 1f                                           // BLINK & BRAT: langsung muncul
+                RevealStyle.SMOOTH -> (age / 100f).coerceIn(0f, 1f)
+                else -> 1f
             }
             paint.color = fontColor
             paint.alpha = (baseAlpha * a).toInt()
@@ -384,10 +413,13 @@ private class BratFrameRenderer(private val lyrics: List<LyricLine>) {
         factor: Float,
         textScale: Float,
         w: Int,
-        h: Int
+        h: Int,
+        boxWidthPct: Float,
+        boxHeightPct: Float
     ) {
         if (cacheIdx == idx && cacheCount == count && cacheFactor == factor &&
-            cacheTextScale == textScale && cacheW == w && cacheH == h
+            cacheTextScale == textScale && cacheW == w && cacheH == h &&
+            cacheBoxWidthPct == boxWidthPct && cacheBoxHeightPct == boxHeightPct
         ) return
         cacheIdx = idx
         cacheCount = count
@@ -395,54 +427,81 @@ private class BratFrameRenderer(private val lyrics: List<LyricLine>) {
         cacheTextScale = textScale
         cacheW = w
         cacheH = h
+        cacheBoxWidthPct = boxWidthPct
+        cacheBoxHeightPct = boxHeightPct
 
         val ws = line.words.take(count)
-        val texts = ws.map { it.text.lowercase() } // brat = huruf kecil semua
-        val padX = w * 0.08f
-        val maxW = w - 2 * padX
-        val maxH = h * 0.72f
-        val minSide = min(w, h).toFloat()
-        var size = minSide * factor * textScale.coerceIn(0.5f, 1.5f)
+        val texts = ws.map { stripTrailingPunct(it.text).lowercase() }
 
-        // Auto-fit tetap aktif walaupun pengguna memperbesar teks.
-        // Ukuran terus dikecilkan sampai semua kata muat secara horizontal
-        // dan seluruh baris muat secara vertikal di dalam frame.
+        // === Box pembatas ===
+        val boxW = w * boxWidthPct
+        val boxH = h * boxHeightPct
+        val padX = (w - boxW) / 2f
+        val maxW = boxW
+        val maxH = boxH
+
+        // === Base size konsisten (dari box, bukan dari frame) ===
+        val baseSide = min(boxW, boxH)
+        val baseSize = baseSide * factor * textScale.coerceIn(0.5f, 1.5f)
+        val minSize = baseSize * 0.60f   // boleh shrink sampai 40% kalau perlu
+
+        // Wrap + shrink terbatas (hanya untuk edge case sedikit overflow)
+        var size = baseSize
         var rows: List<List<Int>> = emptyList()
-        for (attempt in 0 until 80) {
+        for (attempt in 0 until 40) {
             paint.textSize = size
             rows = wrap(texts, maxW)
             val widest = texts.maxOfOrNull { paint.measureText(it) } ?: 0f
             val totalHeight = rows.size * size * 1.02f
-
             if (widest <= maxW && totalHeight <= maxH) break
-
-            val widthScale = if (widest > maxW) maxW / widest else 1f
-            val heightScale = if (totalHeight > maxH) maxH / totalHeight else 1f
-            val shrink = min(widthScale, heightScale).coerceIn(0.05f, 0.95f)
-            size *= shrink * 0.98f
+            if (size <= minSize) break
+            size = (size * 0.95f).coerceAtLeast(minSize)
         }
 
-        // Final safety pass: kata yang sangat panjang tidak boleh keluar frame.
+        // Final wrap di size final
         paint.textSize = size
         rows = wrap(texts, maxW)
-        val widest = texts.maxOfOrNull { paint.measureText(it) } ?: 0f
-        if (widest > maxW) {
-            size *= (maxW / widest).coerceIn(0.01f, 1f)
-            paint.textSize = size
-            rows = wrap(texts, maxW)
+
+        // === Trim rows jika masih overflow tinggi (reset box) ===
+        var lineH = size * 1.02f
+        var maxRows = (maxH / lineH).toInt().coerceAtLeast(1)
+        if (rows.size > maxRows) {
+            rows = rows.take(maxRows)
         }
 
-        val lineH = size * 1.02f
-        val top = (h - rows.size * lineH) / 2f
+        // === Final safety: single long word yang lebih lebar dari box ===
+        val widestFinal = texts.maxOfOrNull { paint.measureText(it) } ?: 0f
+        if (widestFinal > maxW) {
+            size *= (maxW / widestFinal).coerceIn(0.01f, 1f)
+            paint.textSize = size
+            rows = wrap(texts, maxW)
+            lineH = size * 1.02f
+            maxRows = (maxH / lineH).toInt().coerceAtLeast(1)
+            if (rows.size > maxRows) rows = rows.take(maxRows)
+        }
+
+        // === Layout rows di dalam box ===
+        val boxTop = (h - boxH) / 2f
+        val totalTextH = rows.size * lineH
+        val top = boxTop + (boxH - totalTextH) / 2f   // center di dalam box
         val space = paint.measureText(" ")
         val placed = mutableListOf<Placed>()
+
         rows.forEachIndexed { r, row ->
+            // JUSTIFIKASI (rata kiri-kanan)
+            val wordWidths = row.map { paint.measureText(texts[it]) }
+            val naturalWidth = wordWidths.sum() + space * (row.size - 1).coerceAtLeast(0)
+            val extra = (maxW - naturalWidth).coerceAtLeast(0f)
+            val gap = if (row.size > 1) space + extra / (row.size - 1) else 0f
+
+            val baseline = top + r * lineH + size * 0.82f
             var x = padX
-            for (i in row) {
-                placed.add(Placed(ws[i], texts[i], x, top + r * lineH + size * 0.82f))
-                x += paint.measureText(texts[i]) + space
+            for ((col, i) in row.withIndex()) {
+                placed.add(Placed(ws[i], texts[i], x, baseline))
+                x += wordWidths[col] + if (col < row.size - 1) gap else 0f
             }
         }
+
         cacheSize = size
         cachePlaced = placed
     }
@@ -465,9 +524,7 @@ private class BratFrameRenderer(private val lyrics: List<LyricLine>) {
     }
 }
 
-// ============ Export video (MediaCodec + MediaMuxer) ============
-
-/** Potong audio [startUs, endUs] lalu simpan sebagai AAC (.m4a). */
+// ============ Export video ============
 private fun transcodeAudioRange(context: Context, uri: Uri, startUs: Long, endUs: Long, out: File) {
     val extractor = MediaExtractor()
     extractor.setDataSource(context, uri, null)
@@ -645,7 +702,6 @@ private fun transcodeAudioRange(context: Context, uri: Uri, startUs: Long, endUs
     }
 }
 
-/** Gambar frame demi frame (Canvas) -> H.264 video tanpa suara. */
 private fun encodeVideoFrames(
     outFile: File,
     width: Int,
@@ -673,7 +729,6 @@ private fun encodeVideoFrames(
     val info = MediaCodec.BufferInfo()
 
     fun drain(untilEos: Boolean) {
-        // Saat menunggu akhir stream, jangan menunggu selamanya
         val deadline = System.currentTimeMillis() + 10_000L
         while (true) {
             if (untilEos && System.currentTimeMillis() > deadline) {
@@ -693,7 +748,6 @@ private fun encodeVideoFrames(
                     val buf = encoder.getOutputBuffer(i)!!
                     if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) info.size = 0
                     if (info.size > 0 && started) {
-                        // Timestamp dari Surface = jam sistem, jadi kita timpa dengan nomor frame
                         info.presentationTimeUs = written * 1_000_000L / fps
                         written++
                         buf.position(info.offset)
@@ -718,7 +772,7 @@ private fun encodeVideoFrames(
             drain(false)
             if (i % 10 == 0) onProgress(i)
         }
-        onProgress(totalFrames) // semua frame sudah digambar, tinggal finalisasi
+        onProgress(totalFrames)
         encoder.signalEndOfInputStream()
         drain(true)
     } finally {
@@ -727,7 +781,6 @@ private fun encodeVideoFrames(
     }
 }
 
-/** Gabungkan video + audio (tanpa re-encode). */
 private fun muxVideoAndAudio(videoFile: File, audioFile: File, out: File) {
     val vEx = MediaExtractor().apply { setDataSource(videoFile.path) }
     val aEx = MediaExtractor().apply { setDataSource(audioFile.path) }
@@ -812,6 +865,9 @@ private suspend fun exportLyricVideo(
     transparent: Boolean,
     keyColor: Color,
     textScale: Float,
+    blurAmount: Float,
+    boxWidthPct: Float,
+    boxHeightPct: Float,
     onProgress: (Float) -> Unit
 ): Uri = withContext(Dispatchers.Default) {
     val cache = context.cacheDir
@@ -839,7 +895,11 @@ private suspend fun exportLyricVideo(
                 renderer.draw(
                     canvas, aspect.w, aspect.h, bg, fg, t, style, holdMs, shiftMs,
                     blur = !transparent,
-                    textScale = textScale
+                    blurAmount = blurAmount,
+                    textScale = textScale,
+                    boxWidthPct = boxWidthPct,
+                    boxHeightPct = boxHeightPct,
+                    showBoxOutline = false
                 )
             },
             onProgress = { frame -> onProgress(0.10f + 0.75f * frame / totalFrames) }
@@ -858,7 +918,6 @@ private suspend fun exportLyricVideo(
 }
 
 // ============ Activity ============
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -884,7 +943,6 @@ fun BratHomeScreen() {
     var isDragging by remember { mutableStateOf(false) }
     var dragPositionMs by remember { mutableLongStateOf(0L) }
 
-    // === Cut / trim ===
     var trimStartMs by remember { mutableLongStateOf(0L) }
     var trimEndMs by remember { mutableLongStateOf(0L) }
 
@@ -895,20 +953,23 @@ fun BratHomeScreen() {
     var transparentBg by remember { mutableStateOf(false) }
     var keyColor by remember { mutableStateOf(KeyColor.GREEN) }
 
-    // === Gaya & timing lirik ===
     var revealStyle by remember { mutableStateOf(RevealStyle.SMOOTH) }
     var lyricTextScale by rememberSaveable { mutableFloatStateOf(1f) }
     var holdMs by remember { mutableLongStateOf(DEFAULT_HOLD_MS) }
     var shiftMs by remember { mutableLongStateOf(0L) }
+    var blurAmount by rememberSaveable { mutableFloatStateOf(DEFAULT_BLUR_AMOUNT) }
     var showEditor by remember { mutableStateOf(false) }
 
-    // === Transcription state ===
+    // ===== BARU: state box =====
+    var boxWidthPct by rememberSaveable { mutableFloatStateOf(DEFAULT_BOX_WIDTH_PCT) }
+    var boxHeightPct by rememberSaveable { mutableFloatStateOf(DEFAULT_BOX_HEIGHT_PCT) }
+    var showBoxOutline by rememberSaveable { mutableStateOf(false) }
+
     var lyrics by remember { mutableStateOf<List<LyricLine>?>(null) }
-    var selectedLanguage by remember { mutableStateOf("auto") } // "auto", "id", "en", "ru", "es"
+    var selectedLanguage by remember { mutableStateOf("auto") }
     var isTranscribing by remember { mutableStateOf(false) }
     var transcribeError by remember { mutableStateOf<String?>(null) }
 
-    // === Export state ===
     var isExporting by remember { mutableStateOf(false) }
     var exportProgress by remember { mutableFloatStateOf(0f) }
     var exportError by remember { mutableStateOf<String?>(null) }
@@ -972,7 +1033,6 @@ fun BratHomeScreen() {
         }
     }
 
-    // ============== MAIN UI ==============
     Surface(modifier = Modifier.fillMaxSize().systemBarsPadding(), color = APP_BG) {
         Column(
             modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -1045,7 +1105,6 @@ fun BratHomeScreen() {
                 Text("Selected: $it", color = APP_FONT, fontWeight = FontWeight.Bold)
             }
 
-            // ============ CUT SONG ============
             if (isPrepared && durationMs > 0) {
                 Spacer(Modifier.height(28.dp))
                 HorizontalDivider(color = APP_FONT.copy(alpha = 0.2f))
@@ -1116,7 +1175,6 @@ fun BratHomeScreen() {
 
             Spacer(Modifier.height(24.dp))
 
-            // === UI PILIH BAHASA ===
             Text(
                 "LAGU INI BAHASA APA?",
                 fontSize = 11.sp,
@@ -1220,20 +1278,18 @@ fun BratHomeScreen() {
 
             Spacer(Modifier.height(12.dp))
 
-            // ============ EDIT LYRICS ============
             OutlinedButton(
                 onClick = { showEditor = true },
                 enabled = lyrics != null,
                 modifier = Modifier.fillMaxWidth(),
                 border = BorderStroke(1.dp, APP_FONT.copy(alpha = if (lyrics != null) 1f else 0.3f)),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = APP_FONT)
-            ) { Text("EDIT LYRICS (teks & timing)", fontWeight = FontWeight.Bold) }
+            ) { Text("EDIT LYRICS (teks & timing per kata)", fontWeight = FontWeight.Bold) }
 
             Spacer(Modifier.height(28.dp))
             HorizontalDivider(color = APP_FONT.copy(alpha = 0.2f))
             Spacer(Modifier.height(16.dp))
 
-            // ============ REVEAL STYLE ============
             Text(
                 "REVEAL STYLE", fontSize = 12.sp, letterSpacing = 2.sp,
                 fontWeight = FontWeight.Bold, color = APP_FONT,
@@ -1303,6 +1359,96 @@ fun BratHomeScreen() {
 
             Spacer(Modifier.height(16.dp))
 
+            // ===== BARU: BOX WIDTH =====
+            Text(
+                "BOX WIDTH · ${(boxWidthPct * 100).toInt()}%",
+                fontSize = 11.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
+                color = APP_FONT, modifier = Modifier.align(Alignment.Start)
+            )
+            Slider(
+                value = boxWidthPct,
+                onValueChange = { boxWidthPct = it },
+                valueRange = 0.50f..0.95f,
+                colors = SliderDefaults.colors(
+                    thumbColor = APP_FONT,
+                    activeTrackColor = APP_FONT,
+                    inactiveTrackColor = APP_FONT.copy(alpha = 0.3f)
+                )
+            )
+            Text(
+                "Batas lebar teks. Teks yang melebihi batas kanan/kiri turun ke baris bawah.",
+                fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f),
+                modifier = Modifier.align(Alignment.Start)
+            )
+
+            Spacer(Modifier.height(12.dp))
+
+            // ===== BARU: BOX HEIGHT =====
+            Text(
+                "BOX HEIGHT · ${(boxHeightPct * 100).toInt()}%",
+                fontSize = 11.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
+                color = APP_FONT, modifier = Modifier.align(Alignment.Start)
+            )
+            Slider(
+                value = boxHeightPct,
+                onValueChange = { boxHeightPct = it },
+                valueRange = 0.30f..0.90f,
+                colors = SliderDefaults.colors(
+                    thumbColor = APP_FONT,
+                    activeTrackColor = APP_FONT,
+                    inactiveTrackColor = APP_FONT.copy(alpha = 0.3f)
+                )
+            )
+            Text(
+                "Batas tinggi teks. Teks yang melebihi batas bawah dipotong (reset box).",
+                fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f),
+                modifier = Modifier.align(Alignment.Start)
+            )
+
+            Spacer(Modifier.height(12.dp))
+
+            // ===== BARU: SHOW BOX OUTLINE =====
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "SHOW BOX OUTLINE", fontSize = 11.sp, letterSpacing = 2.sp,
+                        fontWeight = FontWeight.Bold, color = APP_FONT
+                    )
+                    Text(
+                        "Tampilkan garis batas box di preview (tidak muncul di video).",
+                        fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f)
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(
+                    checked = showBoxOutline,
+                    onCheckedChange = { showBoxOutline = it },
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = APP_BG,
+                        checkedTrackColor = APP_FONT,
+                        uncheckedThumbColor = APP_FONT,
+                        uncheckedTrackColor = APP_BG,
+                        uncheckedBorderColor = APP_FONT
+                    )
+                )
+            }
+
+            TextButton(onClick = {
+                boxWidthPct = DEFAULT_BOX_WIDTH_PCT
+                boxHeightPct = DEFAULT_BOX_HEIGHT_PCT
+                showBoxOutline = false
+            }) {
+                Text(
+                    "RESET BOX", fontSize = 11.sp, letterSpacing = 2.sp,
+                    color = APP_FONT.copy(alpha = 0.7f)
+                )
+            }
+
+            Spacer(Modifier.height(16.dp))
+
             Text(
                 "TEXT DURATION · tampil ${formatSecs(holdMs)} setelah kata terakhir",
                 fontSize = 11.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
@@ -1335,6 +1481,35 @@ fun BratHomeScreen() {
                     inactiveTrackColor = APP_FONT.copy(alpha = 0.3f)
                 )
             )
+
+            // ===== TEXT BLUR slider (sudah ada sebelumnya) =====
+            Text(
+                "TEXT BLUR · ${(blurAmount * 100).toInt()}%",
+                fontSize = 11.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
+                color = APP_FONT, modifier = Modifier.align(Alignment.Start)
+            )
+            Slider(
+                value = blurAmount,
+                onValueChange = { blurAmount = it },
+                valueRange = 0f..1f,
+                colors = SliderDefaults.colors(
+                    thumbColor = APP_FONT,
+                    activeTrackColor = APP_FONT,
+                    inactiveTrackColor = APP_FONT.copy(alpha = 0.3f)
+                )
+            )
+            Text(
+                "0% = teks tajam, 100% = teks paling blur. Berlaku di preview & video hasil export.",
+                fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f),
+                modifier = Modifier.align(Alignment.Start)
+            )
+            TextButton(onClick = { blurAmount = DEFAULT_BLUR_AMOUNT }) {
+                Text(
+                    "RESET BLUR", fontSize = 11.sp, letterSpacing = 2.sp,
+                    color = APP_FONT.copy(alpha = 0.7f)
+                )
+            }
+
             TextButton(onClick = { holdMs = DEFAULT_HOLD_MS; shiftMs = 0L }) {
                 Text(
                     "RESET TIMING", fontSize = 11.sp, letterSpacing = 2.sp,
@@ -1347,13 +1522,16 @@ fun BratHomeScreen() {
             OutlinedButton(
                 onClick = {
                     mediaPlayer?.let { p ->
-                        p.seekTo(trimStartMs.toInt())
-                        positionMs = trimStartMs
-                        p.start(); isPlaying = true
+                        try {
+                            p.seekTo(trimStartMs.toInt())
+                            p.start()
+                        } catch (_: Exception) {
+                        }
                     }
+                    isPlaying = false
                     isPreviewing = true
                 },
-                enabled = isPrepared,
+                enabled = isPrepared && lyrics != null,
                 modifier = Modifier.fillMaxWidth(),
                 border = BorderStroke(2.dp, APP_FONT),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = APP_FONT)
@@ -1363,7 +1541,6 @@ fun BratHomeScreen() {
             HorizontalDivider(color = APP_FONT.copy(alpha = 0.2f))
             Spacer(Modifier.height(20.dp))
 
-            // ============ VIDEO RATIO ============
             Text(
                 "VIDEO RATIO", fontSize = 12.sp, letterSpacing = 2.sp,
                 fontWeight = FontWeight.Bold, color = APP_FONT,
@@ -1397,7 +1574,6 @@ fun BratHomeScreen() {
 
             Spacer(Modifier.height(28.dp))
 
-            // ============ VIDEO THEME ============
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1530,7 +1706,6 @@ fun BratHomeScreen() {
             HorizontalDivider(color = APP_FONT.copy(alpha = 0.2f))
             Spacer(Modifier.height(20.dp))
 
-            // ============ GENERATE & SAVE VIDEO ============
             Button(
                 onClick = {
                     val uri = audioUri ?: return@Button
@@ -1557,6 +1732,9 @@ fun BratHomeScreen() {
                                 transparent = transparentBg,
                                 keyColor = keyColor.color,
                                 textScale = lyricTextScale,
+                                blurAmount = blurAmount,
+                                boxWidthPct = boxWidthPct,
+                                boxHeightPct = boxHeightPct,
                                 onProgress = { exportProgress = it }
                             )
                         } catch (e: Exception) {
@@ -1689,6 +1867,10 @@ fun BratHomeScreen() {
             fontColor = videoFontColor,
             transparent = transparentBg,
             textScale = lyricTextScale,
+            blurAmount = blurAmount,
+            boxWidthPct = boxWidthPct,
+            boxHeightPct = boxHeightPct,
+            showBoxOutline = showBoxOutline,
             onExit = {
                 runCatching { player.pause() }
                 isPlaying = false; isPreviewing = false
@@ -1716,43 +1898,110 @@ fun BratHomeScreen() {
     }
 }
 
-// ===================== Editor lirik =====================
+// ===================== Editor lirik (per-kata) =====================
 
-private class EditRow(
-    val id: Int,
+private class EditWord(
     text: String,
     startMs: Long,
-    endMs: Long,
-    val original: LyricLine?
+    endMs: Long
 ) {
     var text by mutableStateOf(text)
     var startMs by mutableLongStateOf(startMs)
     var endMs by mutableLongStateOf(endMs)
 }
 
-/** Bangun LyricLine dari hasil edit (teks + start/end). Timing kata dihitung ulang. */
-private fun buildLine(text: String, startMs: Long, endMs: Long, original: LyricLine?): LyricLine? {
-    val ws = text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
-    if (ws.isEmpty()) return null
-    val s = startMs
-    val e = maxOf(endMs, startMs + 100L)
+private class EditRow(
+    val id: Int,
+    initialText: String,
+    initialWords: List<EditWord>
+) {
+    var text by mutableStateOf(initialText)
+    var words by mutableStateOf<List<EditWord>>(initialWords)
+    var expanded by mutableStateOf(false)
 
-    val timings: List<Pair<Long, Long>> =
-        if (original != null && original.words.size == ws.size && original.endMs > original.startMs) {
-            // Jumlah kata sama: pertahankan proporsi timing kata, skala ke rentang baru
-            val os = original.startMs
-            val oe = original.endMs
-            val k = (e - s).toDouble() / (oe - os)
-            original.words.map { w ->
-                (s + ((w.startMs - os) * k).toLong()) to (s + ((w.endMs - os) * k).toLong())
+    private var fallbackStartMs by mutableLongStateOf(initialWords.firstOrNull()?.startMs ?: 0L)
+    private var fallbackEndMs by mutableLongStateOf(
+        initialWords.lastOrNull()?.endMs
+            ?: ((initialWords.firstOrNull()?.startMs ?: 0L) + 2000L)
+    )
+
+    val startMs: Long get() = words.firstOrNull()?.startMs ?: fallbackStartMs
+    val endMs: Long get() = words.lastOrNull()?.endMs ?: fallbackEndMs
+
+    fun updateText(newText: String) {
+        val newTexts = newText.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
+        if (newTexts.isEmpty()) {
+            if (words.isNotEmpty()) {
+                fallbackStartMs = words.first().startMs
+                fallbackEndMs = words.last().endMs
             }
-        } else {
-            // Jumlah kata berubah: bagi rata
-            val step = (e - s).toDouble() / ws.size
-            ws.indices.map { i -> (s + (i * step).toLong()) to (s + ((i + 1) * step).toLong()) }
+            words = emptyList()
+            text = newText
+            return
         }
+        if (words.isEmpty()) {
+            val s = fallbackStartMs
+            val e = fallbackEndMs.coerceAtLeast(s + 100L * newTexts.size)
+            val step = (e - s).toDouble() / newTexts.size
+            words = newTexts.mapIndexed { i, t ->
+                EditWord(t, (s + i * step).toLong(), (s + (i + 1) * step).toLong())
+            }
+            text = newText
+            return
+        }
+        if (newTexts.size == words.size) {
+            words.forEachIndexed { i, w -> w.text = newTexts[i] }
+        } else {
+            val s = startMs
+            val e = endMs.coerceAtLeast(s + 100L * newTexts.size)
+            val step = (e - s).toDouble() / newTexts.size
+            words = newTexts.mapIndexed { i, t ->
+                EditWord(t, (s + i * step).toLong(), (s + (i + 1) * step).toLong())
+            }
+        }
+        text = newText
+    }
 
-    return LyricLine(ws.mapIndexed { i, t -> LyricWord(t, timings[i].first, timings[i].second) })
+    fun adjustLineStart(deltaMs: Long) {
+        if (words.isEmpty()) return
+        val oldStart = words.first().startMs
+        val oldEnd = words.last().endMs
+        if (oldEnd - oldStart < 100L) return
+        val newStart = (oldStart + deltaMs).coerceIn(0L, oldEnd - 100L)
+        val shift = newStart - oldStart
+        if (shift == 0L) return
+        words.forEach { w ->
+            w.startMs += shift
+            w.endMs += shift
+        }
+    }
+
+    fun adjustLineEnd(deltaMs: Long) {
+        if (words.isEmpty()) return
+        val oldStart = words.first().startMs
+        val oldEnd = words.last().endMs
+        if (oldEnd - oldStart < 100L) return
+        val newEnd = (oldEnd + deltaMs).coerceAtLeast(oldStart + 100L)
+        if (newEnd == oldEnd) return
+        val oldSpan = (oldEnd - oldStart).toDouble()
+        val newSpan = (newEnd - oldStart).toDouble()
+        words.forEach { w ->
+            w.startMs = oldStart + ((w.startMs - oldStart) * newSpan / oldSpan).toLong()
+            w.endMs = oldStart + ((w.endMs - oldStart) * newSpan / oldSpan).toLong()
+        }
+    }
+
+    fun adjustWordStart(wordIdx: Int, deltaMs: Long) {
+        val w = words.getOrNull(wordIdx) ?: return
+        w.startMs = (w.startMs + deltaMs)
+            .coerceAtLeast(0L)
+            .coerceAtMost(w.endMs - 50L)
+    }
+
+    fun adjustWordEnd(wordIdx: Int, deltaMs: Long) {
+        val w = words.getOrNull(wordIdx) ?: return
+        w.endMs = (w.endMs + deltaMs).coerceAtLeast(w.startMs + 50L)
+    }
 }
 
 @Composable
@@ -1767,20 +2016,13 @@ private fun LyricEditorDialog(
     val rows = remember {
         mutableStateListOf<EditRow>().also { list ->
             initial.forEachIndexed { i, l ->
-                list.add(
-                    EditRow(
-                        id = i,
-                        text = l.words.joinToString(" ") { it.text },
-                        startMs = l.startMs,
-                        endMs = l.endMs,
-                        original = l
-                    )
-                )
+                val joined = l.words.joinToString(" ") { stripTrailingPunct(it.text) }
+                val words = l.words.map { EditWord(stripTrailingPunct(it.text), it.startMs, it.endMs) }
+                list.add(EditRow(id = i, initialText = joined, initialWords = words))
             }
         }
     }
 
-    // Putar potongan audio untuk mengecek timing baris
     var playCounter by remember { mutableIntStateOf(0) }
     var playFrom by remember { mutableLongStateOf(0L) }
     var playTo by remember { mutableLongStateOf(0L) }
@@ -1815,7 +2057,7 @@ private fun LyricEditorDialog(
                             fontWeight = FontWeight.Black, color = APP_FONT
                         )
                         Text(
-                            "${rows.size} baris · ubah teks, atur start/end, tekan PLAY untuk cek",
+                            "${rows.size} baris · ubah teks, atur start/end, atau timing per kata",
                             fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f)
                         )
                     }
@@ -1825,11 +2067,18 @@ private fun LyricEditorDialog(
                     Button(
                         onClick = {
                             val result = rows
-                                .mapNotNull { buildLine(it.text, it.startMs, it.endMs, it.original) }
+                                .mapNotNull { row ->
+                                    if (row.words.isEmpty()) return@mapNotNull null
+                                    LyricLine(row.words.map {
+                                        LyricWord(it.text, it.startMs, it.endMs)
+                                    })
+                                }
                                 .sortedBy { it.startMs }
                             onSave(result)
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = APP_FONT, contentColor = APP_BG)
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = APP_FONT, contentColor = APP_BG
+                        )
                     ) { Text("SAVE", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
                 }
                 HorizontalDivider(color = APP_FONT.copy(alpha = 0.2f))
@@ -1856,8 +2105,13 @@ private fun LyricEditorDialog(
                         OutlinedButton(
                             onClick = {
                                 val lastEnd = rows.maxOfOrNull { it.endMs } ?: 0L
-                                val start = lastEnd + 300L
-                                rows.add(EditRow(nextId++, "new line", start, start + 2000L, null))
+                                val s = lastEnd + 300L
+                                val e = s + 2000L
+                                val words = listOf(
+                                    EditWord("new", s, s + 1000L),
+                                    EditWord("line", s + 1000L, e)
+                                )
+                                rows.add(EditRow(nextId++, "new line", words))
                             },
                             modifier = Modifier.fillMaxWidth(),
                             border = BorderStroke(1.dp, APP_FONT),
@@ -1897,7 +2151,7 @@ private fun EditRowItem(
         Spacer(Modifier.height(8.dp))
         OutlinedTextField(
             value = row.text,
-            onValueChange = { row.text = it },
+            onValueChange = { row.updateText(it) },
             modifier = Modifier.fillMaxWidth(),
             colors = OutlinedTextFieldDefaults.colors(
                 focusedTextColor = APP_FONT,
@@ -1908,14 +2162,112 @@ private fun EditRowItem(
             )
         )
         Spacer(Modifier.height(8.dp))
-        TimeRow("START", row.startMs) { d ->
-            row.startMs = (row.startMs + d).coerceAtLeast(0L)
-                .coerceAtMost(maxOf(0L, row.endMs - 100L))
+        TimeRow("START", row.startMs) { d -> row.adjustLineStart(d) }
+        Spacer(Modifier.height(6.dp))
+        TimeRow("END", row.endMs) { d -> row.adjustLineEnd(d) }
+
+        Spacer(Modifier.height(8.dp))
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(4.dp),
+            color = Color.Transparent,
+            border = BorderStroke(1.dp, APP_FONT.copy(alpha = 0.5f)),
+            onClick = { row.expanded = !row.expanded }
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (row.expanded) "▼" else "▶",
+                    color = APP_FONT, fontSize = 10.sp, fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "WORD TIMING (${row.words.size} kata)",
+                    color = APP_FONT, fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    "atur per-kata",
+                    color = APP_FONT.copy(alpha = 0.55f), fontSize = 9.sp
+                )
+            }
+        }
+
+        if (row.expanded) {
+            Spacer(Modifier.height(6.dp))
+            row.words.forEachIndexed { wIdx, word ->
+                WordTimingRow(
+                    index = wIdx,
+                    word = word,
+                    onStartDelta = { d -> row.adjustWordStart(wIdx, d) },
+                    onEndDelta = { d -> row.adjustWordEnd(wIdx, d) }
+                )
+                Spacer(Modifier.height(4.dp))
+            }
+            if (row.words.isEmpty()) {
+                Text(
+                    "Teks kosong — isi teks dulu untuk mengatur timing per kata.",
+                    color = APP_FONT.copy(alpha = 0.6f), fontSize = 10.sp
+                )
+            }
+        }
+
+        @Suppress("UNUSED_EXPRESSION")
+        maxMs
+    }
+}
+
+@Composable
+private fun WordTimingRow(
+    index: Int,
+    word: EditWord,
+    onStartDelta: (Long) -> Unit,
+    onEndDelta: (Long) -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth()
+            .border(1.dp, APP_FONT.copy(alpha = 0.15f), RoundedCornerShape(4.dp))
+            .padding(8.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "${index + 1}. ${word.text}",
+                color = APP_FONT, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                "durasi ${formatTenths(word.endMs - word.startMs)}s",
+                color = APP_FONT.copy(alpha = 0.5f), fontSize = 9.sp
+            )
         }
         Spacer(Modifier.height(6.dp))
-        TimeRow("END", row.endMs) { d ->
-            row.endMs = (row.endMs + d).coerceAtLeast(row.startMs + 100L)
-                .coerceAtMost(maxOf(maxMs, row.startMs + 100L))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "S", color = APP_FONT.copy(alpha = 0.7f), fontSize = 10.sp,
+                modifier = Modifier.width(12.dp)
+            )
+            Text(
+                formatTenths(word.startMs), color = APP_FONT, fontSize = 10.sp,
+                modifier = Modifier.width(58.dp)
+            )
+            SmallBtn("-0.1") { onStartDelta(-WORD_DELTA_MS) }
+            Spacer(Modifier.width(4.dp))
+            SmallBtn("+0.1") { onStartDelta(WORD_DELTA_MS) }
+            Spacer(Modifier.weight(1f))
+            Text(
+                "E", color = APP_FONT.copy(alpha = 0.7f), fontSize = 10.sp,
+                modifier = Modifier.width(12.dp)
+            )
+            Text(
+                formatTenths(word.endMs), color = APP_FONT, fontSize = 10.sp,
+                modifier = Modifier.width(58.dp)
+            )
+            SmallBtn("-0.1") { onEndDelta(-WORD_DELTA_MS) }
+            Spacer(Modifier.width(4.dp))
+            SmallBtn("+0.1") { onEndDelta(WORD_DELTA_MS) }
         }
     }
 }
@@ -1989,43 +2341,112 @@ private fun LyricPreviewOverlay(
     fontColor: Color,
     transparent: Boolean,
     textScale: Float,
+    blurAmount: Float,
+    boxWidthPct: Float,
+    boxHeightPct: Float,
+    showBoxOutline: Boolean,
     onExit: () -> Unit
 ) {
     var timeMs by remember { mutableLongStateOf(startMs) }
+    var statusMsg by remember { mutableStateOf("init") }
+    var autoRestarts by remember { mutableIntStateOf(0) }
     val renderer = remember(lyrics) { BratFrameRenderer(lyrics) }
 
-    // Update posisi setiap frame (±60fps) supaya lirik halus mengikuti audio
-    LaunchedEffect(player, startMs, endMs) {
+    // (1) Guard endMs: kalau endMs <= startMs, beri durasi minimum 500ms
+    val safeEnd = remember(startMs, endMs) {
+        if (endMs > startMs + 500L) endMs else startMs + 500L
+    }
+
+    // (4) Cegah tap dari tombol PREVIEW yang "bocor" dan menutup dialog instan
+    var canExit by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        delay(300L)
+        canExit = true
+    }
+
+    LaunchedEffect(player, startMs, safeEnd) {
+        // (2) Pastikan player benar-benar playing
+        runCatching {
+            if (!player.isPlaying) {
+                player.seekTo(startMs.toInt())
+                player.start()
+            }
+            statusMsg = "playing"
+        }.onFailure { e ->
+            statusMsg = "start err: ${e.message?.take(28)}"
+        }
+
+        var lastPos = -1L
+        var stuckCount = 0
+        var fallbackBase = System.currentTimeMillis() - startMs
+        var useFallback = false
+
         while (true) {
-            withFrameNanos { }
+            delay(16L)
+
             val p = try {
                 player.currentPosition.toLong()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                statusMsg = "pos err: ${e.message?.take(28)}"
                 break
             }
-            if (p >= endMs) {
-                player.seekTo(startMs.toInt())
+
+            // (2b) Kalau posisi stuck >2 detik, pakai system clock sebagai fallback
+            if (!useFallback) {
+                if (p == lastPos && p > 0) {
+                    stuckCount++
+                    if (stuckCount > 120) {
+                        useFallback = true
+                        fallbackBase = System.currentTimeMillis() - p
+                        statusMsg = "clock fallback"
+                    }
+                } else {
+                    stuckCount = 0
+                }
+                lastPos = p
+            }
+
+            val t = if (useFallback) System.currentTimeMillis() - fallbackBase else p
+
+            if (t >= safeEnd) {
+                autoRestarts++
+                runCatching {
+                    player.seekTo(startMs.toInt())
+                    player.start()
+                }
                 timeMs = startMs
+                fallbackBase = System.currentTimeMillis() - startMs
+                if (statusMsg.startsWith("playing")) statusMsg = "looping (#$autoRestarts)"
             } else {
-                timeMs = p
+                timeMs = t.coerceAtLeast(startMs)
             }
         }
     }
 
     Dialog(
-        onDismissRequest = onExit,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+        onDismissRequest = { if (canExit) onExit() },
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnClickOutside = false
+        )
     ) {
         Box(
             modifier = Modifier.fillMaxSize().background(Color.Black)
-                .pointerInput(Unit) { detectTapGestures { onExit() } }
+                .pointerInput(canExit) {
+                    if (canExit) {
+                        detectTapGestures { onExit() }
+                    }
+                }
                 .padding(16.dp),
             contentAlignment = Alignment.Center
         ) {
+            // (3) Baca timeMs DI LUAR Canvas draw scope → aman dari observation issue
+            val currentTime = timeMs
+            val currentLyrics = lyrics
+
             Canvas(modifier = Modifier.aspectRatio(aspect.ratio).clipToBounds()) {
-                val t = timeMs // dibaca di sini supaya canvas digambar ulang tiap berubah
+                val t = currentTime
                 if (transparent) {
-                    // Pola kotak-kotak = indikator "transparan" (hanya di preview)
                     drawRect(Color(0xFF2E2E2E))
                     val cell = size.width / 20f
                     var row = 0
@@ -2035,7 +2456,11 @@ private fun LyricPreviewOverlay(
                         var x = 0f
                         while (x < size.width) {
                             if ((row + col) % 2 == 0) {
-                                drawRect(Color(0xFF4A4A4A), topLeft = Offset(x, y), size = Size(cell, cell))
+                                drawRect(
+                                    Color(0xFF4A4A4A),
+                                    topLeft = Offset(x, y),
+                                    size = Size(cell, cell)
+                                )
                             }
                             x += cell; col++
                         }
@@ -2045,11 +2470,18 @@ private fun LyricPreviewOverlay(
                 drawIntoCanvas { c ->
                     renderer.draw(
                         c.nativeCanvas,
-                        size.width.toInt(), size.height.toInt(),
-                        if (transparent) 0 else bgColor.toArgb(), fontColor.toArgb(), t,
+                        size.width.toInt().coerceAtLeast(1),
+                        size.height.toInt().coerceAtLeast(1),
+                        if (transparent) 0 else bgColor.toArgb(),
+                        fontColor.toArgb(),
+                        t,
                         style, holdMs, shiftMs,
                         blur = !transparent,
-                        textScale = textScale
+                        blurAmount = blurAmount,
+                        textScale = textScale,
+                        boxWidthPct = boxWidthPct,
+                        boxHeightPct = boxHeightPct,
+                        showBoxOutline = showBoxOutline
                     )
                 }
             }
@@ -2060,6 +2492,10 @@ private fun LyricPreviewOverlay(
                 color = APP_FONT.copy(alpha = 0.6f),
                 fontSize = 11.sp, letterSpacing = 4.sp, fontWeight = FontWeight.Bold
             )
+
+            // STATUS OVERLAY — kalau ini tidak muncul, berarti Dialog tidak render
+
+
             Text(
                 "TAP ANYWHERE TO EXIT",
                 modifier = Modifier.align(Alignment.BottomCenter),
