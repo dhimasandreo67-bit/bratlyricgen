@@ -64,9 +64,15 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.hebatt.bG.ui.theme.BartTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -77,13 +83,20 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.roundToLong
+import kotlin.math.sin
+import kotlin.math.tanh
 import android.graphics.Canvas as NativeCanvas
-import androidx.compose.foundation.layout.Box
+
 
 // ============ Tema aplikasi ============
 private val APP_BG = Color.Black
@@ -97,7 +110,13 @@ private const val MIN_CUT_MS = 1000L
 private const val EXPORT_FPS = 30
 private const val WORD_DELTA_MS = 100L
 
-// ===== BARU: box default =====
+// ============ Transcribe ============
+private const val WHISPER_RATE = 16_000      // Whisper bekerja di 16 kHz mono
+private const val CHUNK_SEC = 28             // panjang tiap potongan (di bawah window 30 dtk Whisper)
+private const val LOOKAHEAD_SEC = 1.5        // tambahan di ujung potongan supaya kata tidak terpotong
+private const val MAX_PARALLEL = 3           // jumlah request Groq bersamaan
+
+// ===== Box default =====
 private const val DEFAULT_BOX_WIDTH_PCT = 0.84f
 private const val DEFAULT_BOX_HEIGHT_PCT = 0.72f
 
@@ -170,14 +189,16 @@ private data class GroqSegment(val start: Double, val end: Double, val text: Str
 @Serializable
 private data class GroqResponse(
     val text: String = "",
+    val language: String? = null,
     val words: List<GroqWord>? = null,
     val segments: List<GroqSegment>? = null,
 )
 
 private val JsonConfig = Json { ignoreUnknownKeys = true }
+
 /** Hapus tanda baca di akhir kata — titik, koma, seru, tanya, dsb. */
 private fun stripTrailingPunct(s: String): String =
-    s.trimEnd('.',',','!',';',':')
+    s.trimEnd('.', ',', '!', ';', ':')
 
 // ============ Dummy lyrics ============
 private fun buildDummyLyrics(durationMs: Long): List<LyricLine> {
@@ -198,96 +219,430 @@ private fun buildDummyLyrics(durationMs: Long): List<LyricLine> {
     )
 }
 
-// ============ Groq transcribe ============
-private suspend fun transcribeWithGroq(
-    context: Context,
-    uri: Uri,
-    fileName: String,
-    language: String? = null
-): List<LyricLine> = withContext(Dispatchers.IO) {
-    val apiKey = BuildConfig.GROQ_API_KEY
-    if (apiKey.isBlank()) {
-        throw IllegalStateException("GROQ_API_KEY belum diset. Tambahkan di local.properties lalu Clean + Rebuild.")
+/**
+ * Lirik manual: satu baris teks = satu kalimat. Waktu dibagi rata (sesuai jumlah kata)
+ * di sepanjang rentang [startMs, endMs]; rapikan sendiri di EDIT LYRICS.
+ */
+private fun buildLyricsFromText(text: String, startMs: Long, endMs: Long): List<LyricLine> {
+    val wordLines = text.lines()
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .map { l -> l.split(Regex("\\s+")).filter { it.isNotBlank() } }
+        .filter { it.isNotEmpty() }
+    if (wordLines.isEmpty()) return emptyList()
+
+    val totalWords = wordLines.sumOf { it.size }
+    val span = (endMs - startMs).coerceAtLeast(1000L)
+    val msPerWord = span.toDouble() / totalWords
+    var cursor = startMs.toDouble()
+
+    return wordLines.map { ws ->
+        LyricLine(ws.map { w ->
+            val s = cursor.toLong()
+            cursor += msPerWord
+            LyricWord(w, s, (s + msPerWord * 0.9).toLong())
+        })
+    }
+}
+
+// =====================================================================
+//  TRANSCRIBE (Groq Whisper)
+//  Alur: decode HANYA bagian CUT SONG -> mono 16 kHz -> potong 28 dtk ->
+//  kirim paralel (maks 3) -> tiap potongan punya fallback (audio bersih ->
+//  audio "vocal boost") -> gabung -> bagi jadi baris lirik.
+// =====================================================================
+
+private class GroqFatal(message: String) : Exception(message)
+
+private class ChunkOutcome(val words: List<LyricWord>, val lang: String?)
+
+private class DecodedAudio(val pcm: ShortArray, val startMs: Long)
+
+private class ShortBuf(cap: Int = 1 shl 18) {
+    private var a = ShortArray(cap)
+    var size = 0
+        private set
+
+    fun add(v: Short) {
+        if (size == a.size) a = a.copyOf(a.size * 2)
+        a[size++] = v
     }
 
-    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-        ?: throw IllegalStateException("Gagal baca file audio")
+    fun toArray(): ShortArray = a.copyOf(size)
+}
 
-    if (bytes.size > 25 * 1024 * 1024) {
-        throw IllegalStateException(
-            "File ${bytes.size / 1024 / 1024}MB > 25MB limit Groq free tier. " +
-                    "Coba audio lebih pendek atau bitrate lebih rendah."
-        )
+private val LANG_CODES = mapOf(
+    "english" to "en", "indonesian" to "id", "russian" to "ru", "spanish" to "es",
+    "japanese" to "ja", "korean" to "ko", "french" to "fr", "german" to "de",
+    "portuguese" to "pt", "italian" to "it", "chinese" to "zh", "arabic" to "ar",
+    "hindi" to "hi", "turkish" to "tr", "dutch" to "nl", "malay" to "ms",
+    "thai" to "th", "vietnamese" to "vi", "tagalog" to "tl", "polish" to "pl",
+    "ukrainian" to "uk"
+)
+
+private fun languageCode(name: String?): String? {
+    val n = name?.trim()?.lowercase() ?: return null
+    return LANG_CODES[n] ?: if (n.length == 2) n else null
+}
+
+private val HALLUCINATIONS = setOf(
+    "thank you", "thanks for watching", "thank you for watching", "you", "bye",
+    "terima kasih", "terima kasih telah menonton", "subtitles by the amaraorg community"
+)
+
+private fun isHallucination(text: String): Boolean {
+    val n = text.lowercase().replace(Regex("[^\\p{L}\\p{N}\\s]"), "").trim()
+    return n.length < 2 || n in HALLUCINATIONS
+}
+
+/** Decode [startMs, endMs] langsung ke mono 16 kHz (streaming, hemat memori). */
+private fun decodeRangeToMono16k(context: Context, uri: Uri, startMs: Long, endMs: Long): DecodedAudio {
+    val extractor = MediaExtractor()
+    extractor.setDataSource(context, uri, null)
+
+    var trackIdx = -1
+    var format: MediaFormat? = null
+    for (i in 0 until extractor.trackCount) {
+        val f = extractor.getTrackFormat(i)
+        if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+            trackIdx = i; format = f; break
+        }
+    }
+    if (trackIdx < 0 || format == null) {
+        extractor.release()
+        throw IllegalStateException("Tidak ada track audio di file ini")
+    }
+    extractor.selectTrack(trackIdx)
+    val startUs = startMs * 1000L
+    val endUs = endMs * 1000L
+    extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+
+    var srcRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+    var channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceAtLeast(1)
+
+    val decoder = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
+    decoder.configure(format, null, null, 0)
+    decoder.start()
+
+    val out = ShortBuf()
+    val info = MediaCodec.BufferInfo()
+    var inputDone = false
+    var outputDone = false
+    var firstPtsUs = -1L
+
+    // Resampler box-filter: rata-rata sampel input per sampel output
+    var ratio = srcRate.toDouble() / WHISPER_RATE
+    var inIndex = 0.0
+    var nextBoundary = ratio
+    var sum = 0.0
+    var cnt = 0
+
+    try {
+        while (!outputDone) {
+            if (!inputDone) {
+                val ii = decoder.dequeueInputBuffer(10_000L)
+                if (ii >= 0) {
+                    val ib = decoder.getInputBuffer(ii)!!
+                    val sz = extractor.readSampleData(ib, 0)
+                    val st = extractor.sampleTime
+                    if (sz < 0 || st >= endUs) {
+                        decoder.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputDone = true
+                    } else {
+                        decoder.queueInputBuffer(ii, 0, sz, st, 0)
+                        extractor.advance()
+                    }
+                }
+            }
+
+            val oi = decoder.dequeueOutputBuffer(info, 10_000L)
+            when {
+                oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    val f = decoder.outputFormat
+                    srcRate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                    channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT).coerceAtLeast(1)
+                    ratio = srcRate.toDouble() / WHISPER_RATE
+                    nextBoundary = inIndex + ratio
+                    sum = 0.0; cnt = 0
+                }
+
+                oi >= 0 -> {
+                    val usable = info.size > 0 &&
+                            info.presentationTimeUs >= startUs &&
+                            info.presentationTimeUs < endUs
+                    if (usable) {
+                        if (firstPtsUs < 0) firstPtsUs = info.presentationTimeUs
+                        val ob = decoder.getOutputBuffer(oi)!!
+                        ob.position(info.offset)
+                        ob.limit(info.offset + info.size)
+                        val sb = ob.slice().order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+                        val frames = sb.remaining() / channels
+                        for (f in 0 until frames) {
+                            var s = 0
+                            for (c in 0 until channels) s += sb.get(f * channels + c).toInt()
+                            sum += s.toDouble() / channels
+                            cnt++
+                            inIndex += 1.0
+                            if (inIndex >= nextBoundary) {
+                                out.add((sum / cnt).toInt().coerceIn(-32768, 32767).toShort())
+                                sum = 0.0; cnt = 0
+                                nextBoundary += ratio
+                            }
+                        }
+                    }
+                    decoder.releaseOutputBuffer(oi, false)
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
+                }
+            }
+        }
+    } finally {
+        runCatching { decoder.stop() }; decoder.release(); extractor.release()
     }
 
-    val safeName = if (fileName.contains('.')) fileName else "$fileName.m4a"
+    val base = if (firstPtsUs >= 0) firstPtsUs / 1000L else startMs
+    return DecodedAudio(out.toArray(), base)
+}
 
-    val client = OkHttpClient.Builder()
+/** Normalisasi puncak (audio apa adanya, hanya dikeraskan). */
+private fun normalizePeak(pcm: ShortArray): ShortArray {
+    var peak = 1
+    for (s in pcm) {
+        val a = abs(s.toInt())
+        if (a > peak) peak = a
+    }
+    val gain = (30000f / peak).coerceIn(0.5f, 6f)
+    return ShortArray(pcm.size) { i ->
+        (pcm[i] * gain).toInt().coerceIn(-32768, 32767).toShort()
+    }
+}
+
+private class Biquad(lowPass: Boolean, fs: Double, fc: Double, q: Double) {
+    private val b0: Double
+    private val b1: Double
+    private val b2: Double
+    private val a1: Double
+    private val a2: Double
+    private var x1 = 0.0
+    private var x2 = 0.0
+    private var y1 = 0.0
+    private var y2 = 0.0
+
+    init {
+        val w0 = 2.0 * PI * fc / fs
+        val cosW = cos(w0)
+        val alpha = sin(w0) / (2.0 * q)
+        val a0 = 1.0 + alpha
+        if (lowPass) {
+            b0 = (1.0 - cosW) / 2.0 / a0
+            b1 = (1.0 - cosW) / a0
+            b2 = b0
+        } else {
+            b0 = (1.0 + cosW) / 2.0 / a0
+            b1 = -(1.0 + cosW) / a0
+            b2 = b0
+        }
+        a1 = -2.0 * cosW / a0
+        a2 = (1.0 - alpha) / a0
+    }
+
+    fun process(x: Double): Double {
+        val y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2 = x1; x1 = x
+        y2 = y1; y1 = y
+        return y
+    }
+}
+
+/**
+ * "Vocal boost" untuk lagu distorsi/bising: buang bass & desis (150 Hz – 4,5 kHz),
+ * ratakan volume (AGC) supaya vokal yang kecil tidak tenggelam, lalu soft-clip.
+ */
+private fun enhanceVocals(pcm: ShortArray): ShortArray {
+    val fs = WHISPER_RATE.toDouble()
+    val hp1 = Biquad(false, fs, 150.0, 0.7071)
+    val hp2 = Biquad(false, fs, 150.0, 0.7071)
+    val lp = Biquad(true, fs, 4500.0, 0.7071)
+    val out = ShortArray(pcm.size)
+    var env = 0.0
+    for (i in pcm.indices) {
+        val x = lp.process(hp2.process(hp1.process(pcm[i].toDouble())))
+        val a = abs(x)
+        env = if (a > env) a else env * 0.9995
+        val gain = (9000.0 / (env + 1.0)).coerceIn(0.5, 5.0)
+        val y = tanh(x * gain / 20000.0) * 30000.0
+        out[i] = y.toInt().coerceIn(-32768, 32767).toShort()
+    }
+    return out
+}
+
+/** PCM 16-bit mono -> WAV (header little-endian yang benar). */
+private fun pcmToWav(pcm: ShortArray, sampleRate: Int, channels: Int = 1): ByteArray {
+    val dataSize = pcm.size * 2
+    val bb = ByteBuffer.allocate(44 + dataSize).order(ByteOrder.LITTLE_ENDIAN)
+    bb.put("RIFF".toByteArray())
+    bb.putInt(36 + dataSize)
+    bb.put("WAVE".toByteArray())
+    bb.put("fmt ".toByteArray())
+    bb.putInt(16)
+    bb.putShort(1)                                   // PCM
+    bb.putShort(channels.toShort())
+    bb.putInt(sampleRate)
+    bb.putInt(sampleRate * channels * 2)             // byte rate
+    bb.putShort((channels * 2).toShort())            // block align
+    bb.putShort(16)                                  // bits per sample
+    bb.put("data".toByteArray())
+    bb.putInt(dataSize)
+    bb.position(44)
+    bb.asShortBuffer().put(pcm)
+    return bb.array()
+}
+
+private fun buildGroqClient(): OkHttpClient =
+    OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    val bodyBuilder = MultipartBody.Builder()
-        .setType(MultipartBody.FORM)
-        .addFormDataPart("file", safeName, bytes.toRequestBody("audio/*".toMediaTypeOrNull()))
-        .addFormDataPart("model", "whisper-large-v3")
-        .addFormDataPart("response_format", "verbose_json")
-        .addFormDataPart("timestamp_granularities[]", "word")
-        .addFormDataPart("prompt", "Lirik lagu yang dinyanyikan.")
-
-    if (language != null && language != "auto") {
-        bodyBuilder.addFormDataPart("language", language)
-    }
-
-    val request = Request.Builder()
-        .url("https://api.groq.com/openai/v1/audio/transcriptions")
-        .addHeader("Authorization", "Bearer $apiKey")
-        .post(bodyBuilder.build())
-        .build()
-
-    client.newCall(request).execute().use { response ->
-        val raw = response.body?.string() ?: ""
-        if (!response.isSuccessful) {
-            throw IllegalStateException("Groq ${response.code}: ${raw.take(200)}")
+/** Satu request ke Groq, dengan retry otomatis untuk 429 / 5xx. */
+private suspend fun groqRequest(
+    client: OkHttpClient,
+    apiKey: String,
+    wav: ByteArray,
+    model: String,
+    language: String?,
+    temperature: Float
+): GroqResponse {
+    var attempt = 0
+    while (true) {
+        val body = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart("file", "chunk.wav", wav.toRequestBody("audio/wav".toMediaTypeOrNull()))
+            .addFormDataPart("model", model)
+            .addFormDataPart("response_format", "verbose_json")
+            .addFormDataPart("timestamp_granularities[]", "word")
+            .addFormDataPart("temperature", temperature.toString())
+        if (!language.isNullOrBlank() && language != "auto") {
+            body.addFormDataPart("language", language)
         }
-        val parsed = JsonConfig.decodeFromString<GroqResponse>(raw)
-        val lines = convertToLyricLines(parsed)
-        if (lines.isEmpty()) {
-            throw IllegalStateException("Transkripsi kosong — coba audio dengan vokal lebih jelas")
+
+        val request = Request.Builder()
+            .url("https://api.groq.com/openai/v1/audio/transcriptions")
+            .addHeader("Authorization", "Bearer $apiKey")
+            .post(body.build())
+            .build()
+
+        val result = client.newCall(request).execute().use { r ->
+            Triple(r.code, r.body?.string() ?: "", r.header("retry-after"))
         }
-        lines
+        val code = result.first
+        val raw = result.second
+
+        if (code in 200..299) return JsonConfig.decodeFromString<GroqResponse>(raw)
+        if (code == 401 || code == 403) {
+            throw GroqFatal("Groq $code: API key ditolak. Cek GROQ_API_KEY di local.properties.")
+        }
+        if ((code == 429 || code >= 500) && attempt < 2) {
+            attempt++
+            val wait = (result.third?.toDoubleOrNull()?.times(1000)?.toLong() ?: (3000L * attempt))
+                .coerceIn(1000L, 20_000L)
+            delay(wait)
+            continue
+        }
+        throw IllegalStateException("Groq $code: ${raw.take(160)}")
     }
 }
 
-private fun secToMs(sec: Double): Long =
-    ((sec * 1000).toLong() - LYRIC_OFFSET_MS).coerceAtLeast(0L)
+private fun extractWords(resp: GroqResponse, baseMs: Long, keepBeforeSec: Double): List<LyricWord> {
+    fun toAbsMs(sec: Double): Long =
+        (baseMs + (sec * 1000).toLong() - LYRIC_OFFSET_MS).coerceAtLeast(0L)
 
-private fun convertToLyricLines(response: GroqResponse): List<LyricLine> {
-    val words = response.words
-    val segs = response.segments
-
-    val flat: List<LyricWord> = when {
+    val words = resp.words
+    val segs = resp.segments
+    return when {
         !words.isNullOrEmpty() -> words.mapNotNull { w ->
             val t = w.word.trim()
-            if (t.isBlank()) null
-            else LyricWord(t, secToMs(w.start), secToMs(w.end))
+            if (t.isBlank() || w.start >= keepBeforeSec) null
+            else {
+                val s = toAbsMs(w.start)
+                LyricWord(t, s, toAbsMs(w.end).coerceAtLeast(s))
+            }
         }
 
         !segs.isNullOrEmpty() -> segs.flatMap { seg ->
             val ws = seg.text.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
-            if (ws.isEmpty()) emptyList()
+            if (ws.isEmpty() || seg.start >= keepBeforeSec) emptyList()
             else {
                 val step = (seg.end - seg.start) / ws.size
                 ws.mapIndexed { i, w ->
-                    LyricWord(w, secToMs(seg.start + i * step), secToMs(seg.start + (i + 1) * step))
+                    val s = toAbsMs(seg.start + i * step)
+                    LyricWord(w, s, toAbsMs(seg.start + (i + 1) * step).coerceAtLeast(s))
                 }
             }
         }
 
         else -> emptyList()
     }
+}
 
+/** Satu potongan audio: coba audio bersih dulu, kalau kosong coba "vocal boost". */
+private suspend fun transcribeChunk(
+    client: OkHttpClient,
+    apiKey: String,
+    pcm: ShortArray,
+    baseMs: Long,
+    keepBeforeSec: Double,
+    language: String?,
+    errors: MutableList<String>
+): ChunkOutcome {
+    // Lewati potongan yang nyaris sunyi (hemat request)
+    var peak = 0
+    for (s in pcm) {
+        val a = abs(s.toInt())
+        if (a > peak) peak = a
+    }
+    if (peak < 250) return ChunkOutcome(emptyList(), null)
+
+    // (model, temperature, vocalBoost) — tanpa "prompt" agar Whisper tidak berhalusinasi
+    val plans = listOf(
+        Triple("whisper-large-v3", 0f, false),
+        Triple("whisper-large-v3", 0.2f, true)
+    )
+    for ((model, temp, enhance) in plans) {
+        try {
+            val samples = if (enhance) enhanceVocals(pcm) else normalizePeak(pcm)
+            val resp = groqRequest(client, apiKey, pcmToWav(samples, WHISPER_RATE), model, language, temp)
+            val words = extractWords(resp, baseMs, keepBeforeSec)
+            if (words.isNotEmpty() && !isHallucination(resp.text)) {
+                return ChunkOutcome(words, languageCode(resp.language))
+            }
+        } catch (e: GroqFatal) {
+            throw e
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            errors.add(e.message ?: e.javaClass.simpleName)
+        }
+    }
+    return ChunkOutcome(emptyList(), null)
+}
+
+/** Batasi pengulangan kata beruntun (ciri halusinasi Whisper) maksimal 6x. */
+private fun capRepeats(words: List<LyricWord>, maxRun: Int = 6): List<LyricWord> {
+    val out = ArrayList<LyricWord>(words.size)
+    var run = 0
+    var prev = ""
+    for (w in words) {
+        val k = w.text.lowercase().filter { it.isLetterOrDigit() }
+        if (k == prev) run++ else {
+            run = 1; prev = k
+        }
+        if (run <= maxRun) out.add(w)
+    }
+    return out
+}
+
+private fun groupIntoLines(flat: List<LyricWord>): List<LyricLine> {
     val lines = mutableListOf<LyricLine>()
     var cur = mutableListOf<LyricWord>()
     for (w in flat) {
@@ -305,10 +660,95 @@ private fun convertToLyricLines(response: GroqResponse): List<LyricLine> {
         cur.add(w)
     }
     if (cur.isNotEmpty()) lines.add(LyricLine(cur))
-    // Buang tanda baca di akhir setiap kata
-    return lines.map { line ->
-        LyricLine(line.words.map { w -> w.copy(text = stripTrailingPunct(w.text)) })
+
+    // Buang tanda baca di akhir tiap kata
+    return lines.mapNotNull { line ->
+        val ws = line.words
+            .map { w -> w.copy(text = stripTrailingPunct(w.text)) }
+            .filter { it.text.isNotBlank() }
+        if (ws.isEmpty()) null else LyricLine(ws)
     }
+}
+
+private suspend fun transcribeWithGroq(
+    context: Context,
+    uri: Uri,
+    language: String?,
+    startMs: Long,
+    endMs: Long,
+    onProgress: (done: Int, total: Int) -> Unit
+): List<LyricLine> = withContext(Dispatchers.IO) {
+    val apiKey = BuildConfig.GROQ_API_KEY
+    if (apiKey.isBlank()) {
+        throw IllegalStateException("GROQ_API_KEY belum diset. Tambahkan di local.properties lalu Clean + Rebuild.")
+    }
+
+    // 1) Decode hanya bagian CUT SONG -> mono 16 kHz
+    val decoded = decodeRangeToMono16k(context, uri, startMs, endMs)
+    val pcm = decoded.pcm
+    if (pcm.size < WHISPER_RATE) {
+        throw IllegalStateException("Bagian audio terlalu pendek atau gagal di-decode")
+    }
+
+    val client = buildGroqClient()
+    val chunkLen = CHUNK_SEC * WHISPER_RATE
+    val lookLen = (LOOKAHEAD_SEC * WHISPER_RATE).toInt()
+    val total = (pcm.size + chunkLen - 1) / chunkLen
+    val results = arrayOfNulls<List<LyricWord>>(total)
+    val doneCount = AtomicInteger(0)
+    val errors = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+    suspend fun runChunk(i: Int, lang: String?): ChunkOutcome {
+        val from = i * chunkLen
+        val to = min(pcm.size, from + chunkLen)
+        val toLook = min(pcm.size, to + lookLen)
+        val slice = pcm.copyOfRange(from, toLook)
+        val baseMs = decoded.startMs + from * 1000L / WHISPER_RATE
+        val keepBefore =
+            if (i == total - 1) Double.MAX_VALUE else (to - from).toDouble() / WHISPER_RATE
+        val outcome = transcribeChunk(client, apiKey, slice, baseMs, keepBefore, lang, errors)
+        results[i] = outcome.words
+        onProgress(doneCount.incrementAndGet(), total)
+        return outcome
+    }
+
+    // 2) Bahasa: kalau "auto", kunci bahasa dari potongan pertama yang berhasil
+    //    supaya potongan lain tidak salah deteksi bahasa (sering terjadi di lagu distorsi).
+    var lang: String? = if (language.isNullOrBlank() || language == "auto") null else language
+    var locked = lang != null
+    var next = 0
+    while (!locked && next < total) {
+        val outcome = runChunk(next, null)
+        next++
+        if (outcome.words.isNotEmpty()) {
+            lang = outcome.lang
+            locked = true
+        }
+    }
+
+    // 3) Sisa potongan dikirim paralel
+    if (next < total) {
+        val sem = Semaphore(MAX_PARALLEL)
+        val finalLang = lang
+        coroutineScope {
+            (next until total).map { i ->
+                async { sem.withPermit { runChunk(i, finalLang) } }
+            }.awaitAll()
+        }
+    }
+
+    // 4) Gabung & bentuk baris lirik
+    val flat = results.filterNotNull().flatten().sortedBy { it.startMs }
+    val cleaned = capRepeats(flat)
+    if (cleaned.size < 3) {
+        throw IllegalStateException(
+            "Vokal tidak terdeteksi di bagian ini (terlalu distorsi / tertutup musik). " +
+                    "Coba: pilih bahasa lagu secara spesifik, potong ke bagian vokal yang paling jelas, " +
+                    "atau pakai TULIS LIRIK MANUAL lalu rapikan timing di EDIT LYRICS." +
+                    (errors.firstOrNull()?.let { " (Detail: $it)" } ?: "")
+        )
+    }
+    groupIntoLines(cleaned)
 }
 
 // ============ Renderer gaya brat (justify + blur + box) ============
@@ -959,15 +1399,19 @@ fun BratHomeScreen() {
     var shiftMs by remember { mutableLongStateOf(0L) }
     var blurAmount by rememberSaveable { mutableFloatStateOf(DEFAULT_BLUR_AMOUNT) }
     var showEditor by remember { mutableStateOf(false) }
+    var showManual by remember { mutableStateOf(false) }
 
-    // ===== BARU: state box =====
+    // ===== state box =====
     var boxWidthPct by rememberSaveable { mutableFloatStateOf(DEFAULT_BOX_WIDTH_PCT) }
     var boxHeightPct by rememberSaveable { mutableFloatStateOf(DEFAULT_BOX_HEIGHT_PCT) }
     var showBoxOutline by rememberSaveable { mutableStateOf(false) }
 
     var lyrics by remember { mutableStateOf<List<LyricLine>?>(null) }
+    // Rentang lagu yang dipakai saat lirik dibuat (untuk peringatan jika CUT SONG diubah)
+    var lyricsRange by remember { mutableStateOf<Pair<Long, Long>?>(null) }
     var selectedLanguage by remember { mutableStateOf("auto") }
     var isTranscribing by remember { mutableStateOf(false) }
+    var transcribeProgress by remember { mutableStateOf<Pair<Int, Int>?>(null) }
     var transcribeError by remember { mutableStateOf<String?>(null) }
 
     var isExporting by remember { mutableStateOf(false) }
@@ -990,7 +1434,7 @@ fun BratHomeScreen() {
             isPlaying = false; isPrepared = false
             positionMs = 0L; durationMs = 0L
             trimStartMs = 0L; trimEndMs = 0L
-            lyrics = null; transcribeError = null
+            lyrics = null; lyricsRange = null; transcribeError = null
             exportedUri = null; exportError = null
             context.contentResolver.query(it, null, null, null, null)?.use { data ->
                 if (data.moveToFirst()) {
@@ -1116,7 +1560,7 @@ fun BratHomeScreen() {
                     modifier = Modifier.align(Alignment.Start)
                 )
                 Text(
-                    "Video hanya dibuat untuk bagian yang dipilih",
+                    "Video, preview, dan transcribe hanya memakai bagian yang dipilih",
                     fontSize = 11.sp, color = APP_FONT.copy(alpha = 0.65f),
                     modifier = Modifier.align(Alignment.Start)
                 )
@@ -1210,22 +1654,34 @@ fun BratHomeScreen() {
                     }
                 }
             }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Untuk lagu distorsi, pilih bahasa secara spesifik (jangan AUTO) agar hasil lebih akurat.",
+                fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f),
+                modifier = Modifier.align(Alignment.Start)
+            )
 
             Spacer(Modifier.height(12.dp))
 
             Button(
                 onClick = {
                     val uri = audioUri ?: return@Button
-                    val name = audioName ?: "audio.m4a"
                     isTranscribing = true
                     transcribeError = null
+                    transcribeProgress = null
+                    val rs = trimStartMs
+                    val re = trimEndMs
                     scope.launch {
                         try {
-                            lyrics = transcribeWithGroq(context, uri, name, selectedLanguage)
+                            lyrics = transcribeWithGroq(context, uri, selectedLanguage, rs, re) { d, t ->
+                                transcribeProgress = d to t
+                            }
+                            lyricsRange = rs to re
                         } catch (e: Exception) {
                             transcribeError = e.message ?: "Gagal transkripsi"
                         } finally {
                             isTranscribing = false
+                            transcribeProgress = null
                         }
                     }
                 },
@@ -1239,11 +1695,28 @@ fun BratHomeScreen() {
                         color = APP_BG, strokeWidth = 2.dp
                     )
                     Spacer(Modifier.width(10.dp))
-                    Text("TRANSCRIBING...")
+                    val p = transcribeProgress
+                    Text(if (p != null) "TRANSCRIBING ${p.first}/${p.second}..." else "PREPARING AUDIO...")
                 } else {
                     Text(if (lyrics != null) "RE-TRANSCRIBE" else "TRANSCRIBE LYRIC")
                 }
             }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Hanya bagian CUT SONG (${formatTime(trimStartMs)}–${formatTime(trimEndMs)}) yang di-transcribe.",
+                fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f),
+                modifier = Modifier.align(Alignment.Start)
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = { showManual = true },
+                enabled = isPrepared && !isTranscribing,
+                modifier = Modifier.fillMaxWidth(),
+                border = BorderStroke(1.dp, APP_FONT.copy(alpha = if (isPrepared) 1f else 0.3f)),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = APP_FONT)
+            ) { Text("TULIS / PASTE LIRIK MANUAL", fontWeight = FontWeight.Bold) }
 
             lyrics?.let {
                 Spacer(Modifier.height(8.dp))
@@ -1261,10 +1734,21 @@ fun BratHomeScreen() {
                         color = APP_FONT.copy(alpha = 0.8f), fontSize = 11.sp
                     )
                 }
+                val range = lyricsRange
+                if (range != null && (trimStartMs < range.first - 500L || trimEndMs > range.second + 500L)) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Potongan sekarang melebihi bagian yang sudah di-transcribe " +
+                                "(${formatTime(range.first)}–${formatTime(range.second)}). " +
+                                "Transcribe ulang agar lirik lengkap.",
+                        color = Color(0xFFFFEA00), fontSize = 10.sp,
+                        modifier = Modifier.align(Alignment.Start)
+                    )
+                }
             }
             transcribeError?.let {
                 Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(verticalAlignment = Alignment.Top) {
                     Icon(
                         imageVector = Icons.Filled.Warning,
                         contentDescription = "Transcription error",
@@ -1359,7 +1843,6 @@ fun BratHomeScreen() {
 
             Spacer(Modifier.height(16.dp))
 
-            // ===== BARU: BOX WIDTH =====
             Text(
                 "BOX WIDTH · ${(boxWidthPct * 100).toInt()}%",
                 fontSize = 11.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
@@ -1383,7 +1866,6 @@ fun BratHomeScreen() {
 
             Spacer(Modifier.height(12.dp))
 
-            // ===== BARU: BOX HEIGHT =====
             Text(
                 "BOX HEIGHT · ${(boxHeightPct * 100).toInt()}%",
                 fontSize = 11.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
@@ -1407,7 +1889,6 @@ fun BratHomeScreen() {
 
             Spacer(Modifier.height(12.dp))
 
-            // ===== BARU: SHOW BOX OUTLINE =====
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -1482,7 +1963,6 @@ fun BratHomeScreen() {
                 )
             )
 
-            // ===== TEXT BLUR slider (sudah ada sebelumnya) =====
             Text(
                 "TEXT BLUR · ${(blurAmount * 100).toInt()}%",
                 fontSize = 11.sp, letterSpacing = 1.sp, fontWeight = FontWeight.Bold,
@@ -1752,8 +2232,7 @@ fun BratHomeScreen() {
                     if (isExporting) {
                         if (exportProgress >= 0.85f) "FINALIZING VIDEO..."
                         else "GENERATING ${(exportProgress * 100).toInt()}%"
-                    }
-                    else "GENERATE & SAVE VIDEO",
+                    } else "GENERATE & SAVE VIDEO",
                     fontWeight = FontWeight.Black
                 )
             }
@@ -1761,7 +2240,7 @@ fun BratHomeScreen() {
             if (lyrics == null) {
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Transcribe lirik dulu sebelum generate video",
+                    "Transcribe atau tulis lirik dulu sebelum generate video",
                     color = APP_FONT.copy(alpha = 0.6f), fontSize = 11.sp
                 )
             }
@@ -1883,7 +2362,8 @@ fun BratHomeScreen() {
             LyricEditorDialog(
                 initial = current,
                 player = mediaPlayer,
-                maxMs = durationMs,
+                rangeStartMs = trimStartMs,
+                rangeEndMs = trimEndMs,
                 aspect = selectedAspect,
                 style = revealStyle,
                 holdMs = holdMs,
@@ -1906,6 +2386,87 @@ fun BratHomeScreen() {
                     isPlaying = false
                 }
             )
+        }
+    }
+
+    if (showManual) {
+        ManualLyricsDialog(
+            onConfirm = { text ->
+                val built = buildLyricsFromText(text, trimStartMs, trimEndMs)
+                if (built.isEmpty()) {
+                    transcribeError = "Teks lirik kosong."
+                } else {
+                    lyrics = built
+                    lyricsRange = trimStartMs to trimEndMs
+                    transcribeError = null
+                    showEditor = true   // langsung rapikan timing di editor
+                }
+                showManual = false
+            },
+            onCancel = { showManual = false }
+        )
+    }
+}
+
+// ===================== Dialog lirik manual =====================
+
+@Composable
+private fun ManualLyricsDialog(
+    onConfirm: (String) -> Unit,
+    onCancel: () -> Unit
+) {
+    var text by remember { mutableStateOf("") }
+    Dialog(
+        onDismissRequest = onCancel,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(modifier = Modifier.fillMaxSize(), color = APP_BG) {
+            Column(
+                modifier = Modifier.fillMaxSize().systemBarsPadding().padding(16.dp)
+            ) {
+                Text(
+                    "TULIS / PASTE LIRIK", fontSize = 16.sp, letterSpacing = 2.sp,
+                    fontWeight = FontWeight.Black, color = APP_FONT
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Satu baris = satu kalimat. Waktu dibagi rata di sepanjang bagian CUT SONG, " +
+                            "lalu rapikan di EDIT LYRICS (atur START/END dan waktu per kata).",
+                    fontSize = 11.sp, color = APP_FONT.copy(alpha = 0.7f)
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    placeholder = {
+                        Text("i'm so brat\nwe don't stop\nwe don't quit", color = APP_FONT.copy(alpha = 0.35f))
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = APP_FONT,
+                        unfocusedTextColor = APP_FONT,
+                        cursorColor = APP_FONT,
+                        focusedBorderColor = APP_FONT,
+                        unfocusedBorderColor = APP_FONT.copy(alpha = 0.4f)
+                    )
+                )
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(onClick = onCancel) {
+                        Text("CANCEL", color = APP_FONT.copy(alpha = 0.7f), fontSize = 12.sp)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = { onConfirm(text) },
+                        enabled = text.isNotBlank(),
+                        colors = ButtonDefaults.buttonColors(containerColor = APP_FONT, contentColor = APP_BG)
+                    ) { Text("BUAT LIRIK", fontWeight = FontWeight.Bold, fontSize = 12.sp) }
+                }
+            }
         }
     }
 }
@@ -2020,7 +2581,8 @@ private class EditRow(
 private fun LyricEditorDialog(
     initial: List<LyricLine>,
     player: MediaPlayer?,
-    maxMs: Long,
+    rangeStartMs: Long,
+    rangeEndMs: Long,
     aspect: AspectOption,
     style: RevealStyle,
     holdMs: Long,
@@ -2036,6 +2598,10 @@ private fun LyricEditorDialog(
     onSave: (List<LyricLine>) -> Unit,
     onCancel: () -> Unit
 ) {
+    // Preview editor HANYA memutar bagian CUT SONG
+    val rangeStart = rangeStartMs
+    val rangeEnd = maxOf(rangeEndMs, rangeStartMs + 500L)
+
     var nextId by remember { mutableIntStateOf(initial.size) }
     val rows = remember {
         mutableStateListOf<EditRow>().also { list ->
@@ -2056,25 +2622,27 @@ private fun LyricEditorDialog(
 
     var previewPosMs by remember {
         mutableLongStateOf(
-            (rows.firstOrNull()?.startMs ?: 0L).let { (it - 300L).coerceAtLeast(0L) }
+            ((rows.firstOrNull()?.startMs ?: rangeStart) - 300L).coerceIn(rangeStart, rangeEnd)
         )
     }
     var isPreviewPlaying by remember { mutableStateOf(false) }
 
     LaunchedEffect(isPreviewPlaying, player) {
         if (player == null || !isPreviewPlaying) return@LaunchedEffect
-        val end = maxMs.coerceAtLeast(500L)
         while (isPreviewPlaying) {
             delay(33L)
-            runCatching {
-                var pos = player.currentPosition.toLong()
-                if (pos >= end) {
-                    player.seekTo(0)
-                    player.start()
-                    pos = 0
+            val ok = runCatching {
+                val pos = player.currentPosition.toLong()
+                if (pos >= rangeEnd) {
+                    // Berhenti di akhir potongan (bukan lanjut ke akhir lagu)
+                    player.pause()
+                    previewPosMs = rangeEnd
+                    isPreviewPlaying = false
+                } else {
+                    previewPosMs = pos
                 }
-                previewPosMs = pos
             }
+            if (ok.isFailure) isPreviewPlaying = false
         }
     }
 
@@ -2100,7 +2668,7 @@ private fun LyricEditorDialog(
                             fontWeight = FontWeight.Black, color = APP_FONT
                         )
                         Text(
-                            "${rows.size} baris · edit teks & timing, preview realtime di atas",
+                            "${rows.size} baris · preview hanya bagian CUT SONG",
                             fontSize = 10.sp, color = APP_FONT.copy(alpha = 0.65f)
                         )
                     }
@@ -2167,19 +2735,19 @@ private fun LyricEditorDialog(
                             }
                         }
 
-                        // Kontrol: restart, -1s, PLAY/PAUSE, +1s, waktu
+                        // Kontrol: ke awal potongan, -1s, PLAY/PAUSE, +1s, waktu
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.Center
                         ) {
                             SmallBtn("⏮") {
-                                previewPosMs = 0L
-                                runCatching { player?.seekTo(0) }
+                                previewPosMs = rangeStart
+                                runCatching { player?.seekTo(rangeStart.toInt()) }
                             }
                             Spacer(Modifier.width(6.dp))
                             SmallBtn("-1s") {
-                                val n = (previewPosMs - 1000L).coerceAtLeast(0L)
+                                val n = (previewPosMs - 1000L).coerceAtLeast(rangeStart)
                                 previewPosMs = n
                                 runCatching { player?.seekTo(n.toInt()) }
                             }
@@ -2193,7 +2761,9 @@ private fun LyricEditorDialog(
                                         runCatching { p.pause() }
                                         isPreviewPlaying = false
                                     } else {
-                                        if (previewPosMs >= maxMs) previewPosMs = 0L
+                                        if (previewPosMs >= rangeEnd - 100L || previewPosMs < rangeStart) {
+                                            previewPosMs = rangeStart
+                                        }
                                         runCatching {
                                             p.seekTo(previewPosMs.toInt())
                                             p.start()
@@ -2215,27 +2785,31 @@ private fun LyricEditorDialog(
                             }
                             Spacer(Modifier.width(6.dp))
                             SmallBtn("+1s") {
-                                val n = (previewPosMs + 1000L).coerceAtMost(maxMs)
+                                val n = (previewPosMs + 1000L).coerceAtMost(rangeEnd)
                                 previewPosMs = n
                                 runCatching { player?.seekTo(n.toInt()) }
                             }
                             Spacer(Modifier.width(8.dp))
                             Text(
-                                "${formatTenths(previewPosMs)} / ${formatTenths(maxMs)}",
+                                "${formatTenths(previewPosMs)} / ${formatTenths(rangeEnd)}",
                                 color = APP_FONT, fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
                         }
+                        Text(
+                            "potongan ${formatTenths(rangeStart)} – ${formatTenths(rangeEnd)}",
+                            color = APP_FONT.copy(alpha = 0.55f), fontSize = 9.sp
+                        )
 
-                        // Seek bar
+                        // Seek bar (hanya di dalam potongan)
                         Slider(
                             value = previewPosMs.toFloat()
-                                .coerceIn(0f, maxMs.toFloat().coerceAtLeast(1f)),
+                                .coerceIn(rangeStart.toFloat(), rangeEnd.toFloat()),
                             onValueChange = {
                                 previewPosMs = it.toLong()
                                 runCatching { player?.seekTo(previewPosMs.toInt()) }
                             },
-                            valueRange = 0f..maxMs.toFloat().coerceAtLeast(1f),
+                            valueRange = rangeStart.toFloat()..rangeEnd.toFloat(),
                             modifier = Modifier.padding(horizontal = 4.dp),
                             colors = SliderDefaults.colors(
                                 thumbColor = APP_FONT,
@@ -2257,9 +2831,8 @@ private fun LyricEditorDialog(
                         EditRowItem(
                             index = index,
                             row = row,
-                            maxMs = maxMs,
                             onPlay = {
-                                val from = (row.startMs - 300L).coerceAtLeast(0L)
+                                val from = (row.startMs - 300L).coerceIn(rangeStart, rangeEnd)
                                 previewPosMs = from
                                 runCatching {
                                     player?.seekTo(from.toInt())
@@ -2273,8 +2846,8 @@ private fun LyricEditorDialog(
                     item {
                         OutlinedButton(
                             onClick = {
-                                val lastEnd = rows.maxOfOrNull { it.endMs } ?: 0L
-                                val s = lastEnd + 300L
+                                val lastEnd = rows.maxOfOrNull { it.endMs } ?: rangeStart
+                                val s = maxOf(rangeStart, lastEnd + 300L)
                                 val e = s + 2000L
                                 val words = listOf(
                                     EditWord("new", s, s + 1000L),
@@ -2298,7 +2871,6 @@ private fun LyricEditorDialog(
 private fun EditRowItem(
     index: Int,
     row: EditRow,
-    maxMs: Long,
     onPlay: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -2383,9 +2955,6 @@ private fun EditRowItem(
                 )
             }
         }
-
-        @Suppress("UNUSED_EXPRESSION")
-        maxMs
     }
 }
 
@@ -2517,160 +3086,137 @@ private fun LyricPreviewOverlay(
     onExit: () -> Unit
 ) {
     var timeMs by remember { mutableLongStateOf(startMs) }
-    var statusMsg by remember { mutableStateOf("init") }
-    var autoRestarts by remember { mutableIntStateOf(0) }
+    var isFinished by remember { mutableStateOf(false) }
+    var runId by remember { mutableIntStateOf(0) }
     val renderer = remember(lyrics) { BratFrameRenderer(lyrics) }
 
-    // (1) Guard endMs: kalau endMs <= startMs, beri durasi minimum 500ms
-    val safeEnd = remember(startMs, endMs) {
-        if (endMs > startMs + 500L) endMs else startMs + 500L
-    }
-
-    // (4) Cegah tap dari tombol PREVIEW yang "bocor" dan menutup dialog instan
-    var canExit by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) {
-        delay(300L)
-        canExit = true
-    }
-
-    LaunchedEffect(player, startMs, safeEnd) {
-        // (2) Pastikan player benar-benar playing
-        runCatching {
-            if (!player.isPlaying) {
-                player.seekTo(startMs.toInt())
-                player.start()
-            }
-            statusMsg = "playing"
-        }.onFailure { e ->
-            statusMsg = "start err: ${e.message?.take(28)}"
-        }
-
-        var lastPos = -1L
-        var stuckCount = 0
-        var fallbackBase = System.currentTimeMillis() - startMs
-        var useFallback = false
-
+    // runId ikut jadi key supaya loop jalan lagi setelah "ULANGI POTONGAN"
+    LaunchedEffect(player, startMs, endMs, runId) {
         while (true) {
-            delay(16L)
-
+            withFrameNanos { }
             val p = try {
                 player.currentPosition.toLong()
-            } catch (e: Exception) {
-                statusMsg = "pos err: ${e.message?.take(28)}"
+            } catch (_: Exception) {
                 break
             }
-
-            // (2b) Kalau posisi stuck >2 detik, pakai system clock sebagai fallback
-            if (!useFallback) {
-                if (p == lastPos && p > 0) {
-                    stuckCount++
-                    if (stuckCount > 120) {
-                        useFallback = true
-                        fallbackBase = System.currentTimeMillis() - p
-                        statusMsg = "clock fallback"
-                    }
-                } else {
-                    stuckCount = 0
-                }
-                lastPos = p
-            }
-
-            val t = if (useFallback) System.currentTimeMillis() - fallbackBase else p
-
-            if (t >= safeEnd) {
-                autoRestarts++
-                runCatching {
-                    player.seekTo(startMs.toInt())
-                    player.start()
-                }
-                timeMs = startMs
-                fallbackBase = System.currentTimeMillis() - startMs
-                if (statusMsg.startsWith("playing")) statusMsg = "looping (#$autoRestarts)"
+            if (p >= endMs && p > startMs) {
+                runCatching { player.pause() }
+                timeMs = endMs
+                isFinished = true
+                break
             } else {
-                timeMs = t.coerceAtLeast(startMs)
+                timeMs = p
             }
         }
     }
 
     Dialog(
-        onDismissRequest = { if (canExit) onExit() },
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            dismissOnClickOutside = false
-        )
+        onDismissRequest = onExit,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
     ) {
         Box(
             modifier = Modifier.fillMaxSize().background(Color.Black)
-                .pointerInput(canExit) {
-                    if (canExit) {
-                        detectTapGestures { onExit() }
-                    }
-                }
+                .pointerInput(Unit) { detectTapGestures { onExit() } }
                 .padding(16.dp),
             contentAlignment = Alignment.Center
         ) {
-            // (3) Baca timeMs DI LUAR Canvas draw scope → aman dari observation issue
-            val currentTime = timeMs
-            val currentLyrics = lyrics
-
-            Canvas(modifier = Modifier.aspectRatio(aspect.ratio).clipToBounds()) {
-                val t = currentTime
-                if (transparent) {
-                    drawRect(Color(0xFF2E2E2E))
-                    val cell = size.width / 20f
-                    var row = 0
-                    var y = 0f
-                    while (y < size.height) {
-                        var col = 0
-                        var x = 0f
-                        while (x < size.width) {
-                            if ((row + col) % 2 == 0) {
-                                drawRect(
-                                    Color(0xFF4A4A4A),
-                                    topLeft = Offset(x, y),
-                                    size = Size(cell, cell)
-                                )
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Canvas(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(aspect.ratio)
+                        .clipToBounds()
+                ) {
+                    val t = timeMs
+                    if (transparent) {
+                        drawRect(Color(0xFF2E2E2E))
+                        val cell = size.width / 20f
+                        var row = 0
+                        var y = 0f
+                        while (y < size.height) {
+                            var col = 0
+                            var x = 0f
+                            while (x < size.width) {
+                                if ((row + col) % 2 == 0) {
+                                    drawRect(
+                                        Color(0xFF4A4A4A),
+                                        topLeft = Offset(x, y),
+                                        size = Size(cell, cell)
+                                    )
+                                }
+                                x += cell; col++
                             }
-                            x += cell; col++
+                            y += cell; row++
                         }
-                        y += cell; row++
+                    }
+                    drawIntoCanvas { c ->
+                        renderer.draw(
+                            c.nativeCanvas,
+                            size.width.toInt().coerceAtLeast(1),
+                            size.height.toInt().coerceAtLeast(1),
+                            if (transparent) 0 else bgColor.toArgb(),
+                            fontColor.toArgb(),
+                            t,
+                            style, holdMs, shiftMs,
+                            blur = !transparent,
+                            blurAmount = blurAmount,
+                            textScale = textScale,
+                            boxWidthPct = boxWidthPct,
+                            boxHeightPct = boxHeightPct,
+                            showBoxOutline = showBoxOutline
+                        )
                     }
                 }
-                drawIntoCanvas { c ->
-                    renderer.draw(
-                        c.nativeCanvas,
-                        size.width.toInt().coerceAtLeast(1),
-                        size.height.toInt().coerceAtLeast(1),
-                        if (transparent) 0 else bgColor.toArgb(),
-                        fontColor.toArgb(),
-                        t,
-                        style, holdMs, shiftMs,
-                        blur = !transparent,
-                        blurAmount = blurAmount,
-                        textScale = textScale,
-                        boxWidthPct = boxWidthPct,
-                        boxHeightPct = boxHeightPct,
-                        showBoxOutline = showBoxOutline
+
+                Spacer(Modifier.height(12.dp))
+
+                if (isFinished) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            "PREVIEW SELESAI (potongan ${formatTenths(startMs)} – ${formatTenths(endMs)})",
+                            color = APP_FONT, fontSize = 11.sp,
+                            letterSpacing = 2.sp, fontWeight = FontWeight.Bold
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = {
+                                    runCatching {
+                                        player.seekTo(startMs.toInt())
+                                        player.start()
+                                    }
+                                    timeMs = startMs
+                                    isFinished = false
+                                    runId++
+                                },
+                                border = BorderStroke(1.dp, APP_FONT),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = APP_FONT)
+                            ) { Text("ULANGI POTONGAN", fontSize = 10.sp) }
+                            OutlinedButton(
+                                onClick = onExit,
+                                border = BorderStroke(1.dp, APP_FONT),
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = APP_FONT)
+                            ) { Text("KELUAR", fontSize = 10.sp) }
+                        }
+                    }
+                } else {
+                    Text(
+                        "PREVIEW ${aspect.label} · ${style.label} · " +
+                                "potongan ${formatTime(startMs)}–${formatTime(endMs)}",
+                        color = APP_FONT.copy(alpha = 0.6f),
+                        fontSize = 11.sp, letterSpacing = 2.sp, fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "TAP ANYWHERE TO EXIT",
+                        color = APP_FONT.copy(alpha = 0.5f),
+                        fontSize = 10.sp, letterSpacing = 3.sp
                     )
                 }
             }
-
-            Text(
-                "PREVIEW ${aspect.label} · ${style.label}",
-                modifier = Modifier.align(Alignment.TopCenter),
-                color = APP_FONT.copy(alpha = 0.6f),
-                fontSize = 11.sp, letterSpacing = 4.sp, fontWeight = FontWeight.Bold
-            )
-
-            // STATUS OVERLAY — kalau ini tidak muncul, berarti Dialog tidak render
-
-
-            Text(
-                "TAP ANYWHERE TO EXIT",
-                modifier = Modifier.align(Alignment.BottomCenter),
-                color = APP_FONT.copy(alpha = 0.5f),
-                fontSize = 10.sp, letterSpacing = 3.sp
-            )
         }
     }
 }
